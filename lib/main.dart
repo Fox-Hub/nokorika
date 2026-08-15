@@ -9,6 +9,7 @@ import 'package:timezone/timezone.dart' as tz;
 import 'holiday_service.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/cupertino.dart';
+import 'tutorial_overlay.dart';
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
@@ -192,9 +193,10 @@ class CalendarScreen extends StatefulWidget {
   State<CalendarScreen> createState() => _CalendarScreenState();
 }
 
-class _CalendarScreenState extends State<CalendarScreen> {
+class _CalendarScreenState extends State<CalendarScreen>
+    with WidgetsBindingObserver {
   DateTime _focusedDay = DateTime.now();
-  final DateTime _today = DateTime.now();
+  DateTime _today = DateTime.now();
   final PageController _pageController = PageController();
   final TextEditingController _milestoneTitleController =
       TextEditingController();
@@ -218,17 +220,141 @@ class _CalendarScreenState extends State<CalendarScreen> {
   bool _needsScrollToToday = true;
   DateTime? _lastScrolledMonth;
 
+  // --- 初回起動チュートリアル用のハイライト対象キー ---
+  final GlobalKey _tutorialCalendarKey = GlobalKey();
+  final GlobalKey _tutorialSearchKey = GlobalKey();
+  final GlobalKey _tutorialTopCardsKey = GlobalKey();
+  final GlobalKey _tutorialTodayKey = GlobalKey();
+  final GlobalKey _tutorialViewToggleKey = GlobalKey();
+  final GlobalKey _tutorialListKey = GlobalKey();
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadData();
     _loadHolidays();
+    // 対象ウィジェットの初回描画が終わった後にチュートリアルを判定・表示する
+    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeShowTutorial());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // バックグラウンドから復帰したタイミングで、日付が変わっていないか確認する
+    if (state == AppLifecycleState.resumed) {
+      _refreshTodayIfDateChanged();
+    }
+  }
+
+  /// アプリがバックグラウンドにいる間に日付が変わっていた場合、
+  /// 「今日」の情報を最新化してカレンダー表示を更新する
+  void _refreshTodayIfDateChanged() {
+    final now = DateTime.now();
+    if (isSameDay(_today, now)) return;
+
+    final oldToday = _today;
+    setState(() {
+      _today = now;
+      // 新しい「今日」へ再スクロールできるようにする
+      _needsScrollToToday = true;
+      // 表示中の月が「変わる前の今日」の月だった場合は、新しい今日の月に追従させる
+      if (_focusedDay.year == oldToday.year &&
+          _focusedDay.month == oldToday.month) {
+        _focusedDay = now;
+      }
+    });
+
+    // 年をまたいで日付が変わった場合に備えて祝日情報も読み直す
+    if (now.year != oldToday.year) {
+      _loadHolidays();
+    }
+  }
+
+  /// 初回起動時のみ、画面を暗転させてハイライトするチュートリアルを表示する
+  Future<void> _maybeShowTutorial() async {
+    if (!mounted) return;
+    await TutorialManager.showIfNeeded(
+      context: context,
+      tutorialId: 'calendar_home_v1',
+      steps: [
+        TutorialStep(
+          targetKey: _tutorialSearchKey,
+          title: 'ここをタップ！',
+          description: '虫眼鏡アイコンから、過去や未来の予定をキーワードで検索できます。',
+          shape: TutorialShape.circle,
+        ),
+        TutorialStep(
+          targetKey: _tutorialTodayKey,
+          title: 'ここをタップ！',
+          description: 'このアイコンをタップすると、表示中のカレンダーがすぐに今月に戻ります。',
+          shape: TutorialShape.circle,
+        ),
+        TutorialStep(
+          targetKey: _tutorialViewToggleKey,
+          title: 'ここをタップ！',
+          description: 'カレンダー表示と、時間軸で予定を確認できるタイムライン表示を切り替えられます。',
+          shape: TutorialShape.circle,
+        ),
+        TutorialStep(
+          targetKey: _tutorialTopCardsKey,
+          title: 'スワイプ！',
+          description:
+              '上部のカードは左右にスワイプできます。スワイプして最後まで進むと「重要日を追加」カードが登場し、そこをタップすれば新しい予定を追加できます。カードの長押しで編集が可能です。',
+        ),
+        TutorialStep(
+          targetKey: _tutorialCalendarKey,
+          title: 'ここをタップ！',
+          description: 'カレンダーの日付をタップすると、その日の予定やメモを追加・編集できます。',
+        ),
+        TutorialStep(
+          targetKey: _tutorialListKey,
+          title: 'ここをタップ！',
+          description: '予定一覧の中から気になる日をタップすると、その日の予定の詳細を確認できます。',
+        ),
+      ],
+    );
   }
 
   Future<void> _loadHolidays() async {
     final holidays = await HolidayService.fetchHolidays();
     if (mounted) {
-      setState(() => _japaneseHolidays = holidays);
+      setState(() {
+        _japaneseHolidays = holidays;
+        _applyHolidayMemoDefaults();
+      });
+    }
+  }
+
+  // 祝日名を、メモが未入力の日付にあらかじめ設定する
+  void _applyHolidayMemoDefaults() {
+    if (_japaneseHolidays.isEmpty) return;
+    bool changed = false;
+    _japaneseHolidays.forEach((dateStr, name) {
+      try {
+        final parts = dateStr.split('-');
+        final date = DateTime(
+          int.parse(parts[0]),
+          int.parse(parts[1]),
+          int.parse(parts[2]),
+        );
+        final config = _holidayConfigs.putIfAbsent(date, () => HolidayData());
+        if (config.memo.isEmpty) {
+          config.memo = name;
+          changed = true;
+        }
+      } catch (_) {
+        // 日付形式が想定外の場合はスキップ
+      }
+    });
+    if (changed) {
+      _saveData();
     }
   }
 
@@ -282,6 +408,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
               MapEntry(DateTime.parse(k), HolidayData.fromJson(jsonDecode(v))),
         );
       }
+      _applyHolidayMemoDefaults();
       String? milestonesJson = prefs.getString('saved_milestones');
       if (milestonesJson != null) {
         List<dynamic> decoded = jsonDecode(milestonesJson);
@@ -428,8 +555,17 @@ class _CalendarScreenState extends State<CalendarScreen> {
                     ? _buildTimelineView()
                     : Column(
                         children: [
-                          _buildTopCards(count, lastBD),
-                          Expanded(flex: 3, child: _buildCalendarCard(lastBD)),
+                          KeyedSubtree(
+                            key: _tutorialTopCardsKey,
+                            child: _buildTopCards(count, lastBD),
+                          ),
+                          Expanded(
+                            flex: 3,
+                            child: KeyedSubtree(
+                              key: _tutorialCalendarKey,
+                              child: _buildCalendarCard(lastBD),
+                            ),
+                          ),
                           Padding(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 20,
@@ -457,7 +593,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
                           ),
                           Expanded(
                             flex: 2,
-                            child: _buildBusinessDayList(businessDays),
+                            child: KeyedSubtree(
+                              key: _tutorialListKey,
+                              child: _buildBusinessDayList(businessDays),
+                            ),
                           ),
                         ],
                       ),
@@ -861,6 +1000,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               IconButton(
+                key: _tutorialSearchKey,
                 icon: const Icon(Icons.search_rounded, size: 24),
                 tooltip: '検索',
                 onPressed: () async {
@@ -882,6 +1022,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                 },
               ),
               IconButton(
+                key: _tutorialTodayKey,
                 icon: const Icon(Icons.today_rounded, size: 22),
                 tooltip: '今日に戻る',
                 onPressed: () => setState(() {
@@ -890,6 +1031,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                 }),
               ),
               IconButton(
+                key: _tutorialViewToggleKey,
                 icon: Icon(
                   _isTimelineMode
                       ? Icons
@@ -1426,12 +1568,12 @@ class _CalendarScreenState extends State<CalendarScreen> {
                 },
                 child: _buildCountContent(
                   milestone['title'],
-                  diff == 0 ? '当日' : '${diff.abs()}',
+                  diff == 0 ? '当日' : (diff > 0 ? '${diff.abs()}' : '超過'),
                   diff == 0
                       ? (_isOffDay(targetDate) ? '本日（休日）' : '本日の予定です')
                       : (diff > 0
                             ? '設定期限日: ${targetDate.month}/${targetDate.day}'
-                            : '${diff.abs()} 日経過'),
+                            : '期限を超過しています\n再設定は長押しで編集'),
                   cardColor,
                 ),
               );
@@ -1463,6 +1605,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
         ),
         Text(
           subText,
+          textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 14,
             color: Colors.grey.shade600,
@@ -1594,6 +1737,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
       child: TableCalendar(
         // 2026年固定から、現在のシステム日付に合わせた動的レンジにUX改善
         calendarFormat: _calendarFormat, // 現在のフォーマットを適用
+        // 月表示のみを許可し、縦スワイプによる2週間表示への切り替えを無効化
+        availableCalendarFormats: const {CalendarFormat.month: '月'},
         onFormatChanged: (format) {
           setState(() {
             _calendarFormat = format; // 手動でスワイプ等された場合も状態を同期
