@@ -9,6 +9,7 @@ import 'package:timezone/timezone.dart' as tz;
 import 'holiday_service.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/cupertino.dart';
+import 'package:in_app_review/in_app_review.dart';
 import 'tutorial_overlay.dart';
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -34,7 +35,9 @@ Future<void> main() async {
     iOS: initializationSettingsIOS,
   );
 
-  await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+  await flutterLocalNotificationsPlugin.initialize(
+    settings: initializationSettings,
+  );
 
   final AndroidFlutterLocalNotificationsPlugin? androidImplementation =
       flutterLocalNotificationsPlugin
@@ -173,6 +176,10 @@ class HolidayData {
 
 enum DayFilter { all, withEvent, holiday }
 
+// 休日に当たった日をどちらへ調整するか
+// postpone: 後ろ倒し（次の営業日へ）/ advance: 前倒し（前の営業日へ）
+enum HolidayAdjustDirection { postpone, advance }
+
 class FixedHoliday {
   int month;
   int day;
@@ -203,9 +210,12 @@ class _CalendarScreenState extends State<CalendarScreen>
   final ScrollController _scrollController = ScrollController();
 
   List<Map<String, dynamic>> _milestones = [];
+  bool _overdueBannerDismissed = false;
   bool _includeWeekends = false;
   Map<DateTime, HolidayData> _holidayConfigs = {};
   List<FixedHoliday> _fixedHolidays = [];
+  HolidayAdjustDirection _holidayAdjustDirection =
+      HolidayAdjustDirection.postpone;
   DayFilter _dayFilter = DayFilter.all;
   Map<String, String> _japaneseHolidays = {};
   CalendarFormat _calendarFormat = CalendarFormat.month;
@@ -269,11 +279,18 @@ class _CalendarScreenState extends State<CalendarScreen>
           _focusedDay.month == oldToday.month) {
         _focusedDay = now;
       }
+      // 日付が変わったので、超過バナーは再度表示できるようにリセットする
+      _overdueBannerDismissed = false;
     });
 
     // 年をまたいで日付が変わった場合に備えて祝日情報も読み直す
     if (now.year != oldToday.year) {
       _loadHolidays();
+    }
+    // 月が変わった場合、今月分の最終営業日通知・繰り返し予定の通知を計算し直す
+    if (now.year != oldToday.year || now.month != oldToday.month) {
+      _scheduleLastBusinessDayNotification();
+      _rescheduleRecurringMilestoneNotifications();
     }
   }
 
@@ -329,6 +346,9 @@ class _CalendarScreenState extends State<CalendarScreen>
         _japaneseHolidays = holidays;
         _applyHolidayMemoDefaults();
       });
+      // 祝日データが揃ったので、最終営業日通知を計算し直す
+      _scheduleLastBusinessDayNotification();
+      _rescheduleRecurringMilestoneNotifications();
     }
   }
 
@@ -367,10 +387,18 @@ class _CalendarScreenState extends State<CalendarScreen>
     );
     await prefs.setString('holiday_configs', jsonEncode(dataToSave));
     await prefs.setBool('include_weekends', _includeWeekends);
+    await prefs.setInt(
+      'holiday_adjust_direction',
+      _holidayAdjustDirection.index,
+    );
     List<String> fixedList = _fixedHolidays
         .map((e) => jsonEncode(e.toJson()))
         .toList();
     await prefs.setStringList('fixed_holidays_v2', fixedList);
+    // 休日設定・調整方向が変わると最終営業日や繰り返し予定の通知日が
+    // ずれる可能性があるため計算し直す
+    _scheduleLastBusinessDayNotification();
+    _rescheduleRecurringMilestoneNotifications();
   }
 
   Future<void> _saveMilestones() async {
@@ -390,10 +418,39 @@ class _CalendarScreenState extends State<CalendarScreen>
     await prefs.setString('saved_milestones', encodedData);
   }
 
+  // 重要日の登録数が一定数に達したタイミングで、ストア評価ダイアログ（ネイティブ）
+  // を一度だけ表示する。すでにリクエスト済みの場合は再表示しない。
+  static const int _reviewRequestThreshold = 5;
+
+  Future<void> _maybeRequestReview() async {
+    final prefs = await SharedPreferences.getInstance();
+    final bool alreadyRequested =
+        prefs.getBool('has_requested_review') ?? false;
+    if (alreadyRequested) return;
+
+    if (_milestones.length < _reviewRequestThreshold) return;
+
+    try {
+      final InAppReview inAppReview = InAppReview.instance;
+      if (await inAppReview.isAvailable()) {
+        await inAppReview.requestReview();
+        await prefs.setBool('has_requested_review', true);
+      }
+    } catch (e) {
+      debugPrint('レビューリクエストに失敗しました: $e');
+    }
+  }
+
   Future<void> _loadData() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _includeWeekends = prefs.getBool('include_weekends') ?? false;
+      final savedDirectionIndex = prefs.getInt('holiday_adjust_direction');
+      if (savedDirectionIndex != null &&
+          savedDirectionIndex < HolidayAdjustDirection.values.length) {
+        _holidayAdjustDirection =
+            HolidayAdjustDirection.values[savedDirectionIndex];
+      }
       List<String>? fixedJsonList = prefs.getStringList('fixed_holidays_v2');
       if (fixedJsonList != null) {
         _fixedHolidays = fixedJsonList
@@ -430,6 +487,9 @@ class _CalendarScreenState extends State<CalendarScreen>
       }
       _needsScrollToToday = true;
     });
+    // 休日設定・weekend設定が揃ったので、最終営業日通知を計算し直す
+    _scheduleLastBusinessDayNotification();
+    _rescheduleRecurringMilestoneNotifications();
   }
 
   String _dateKeyString(DateTime date) =>
@@ -454,6 +514,20 @@ class _CalendarScreenState extends State<CalendarScreen>
     return false;
   }
 
+  // 期限を超過している予定を集計する。
+  // 「毎月繰り返す」予定は月が変わると自動的に今月分の日付に
+  // 読み替えられ、超過扱いにはならないため対象から除外する。
+  List<Map<String, dynamic>> _overdueMilestones() {
+    final todayDate = DateTime(_today.year, _today.month, _today.day);
+    return _milestones.where((m) {
+      if (m['isRecurring'] == true) return false;
+      final date = m['date'] as DateTime?;
+      if (date == null) return false;
+      final targetDate = DateTime(date.year, date.month, date.day);
+      return targetDate.isBefore(todayDate);
+    }).toList();
+  }
+
   bool _isRedLetterHoliday(DateTime day) {
     final date = DateTime(day.year, day.month, day.day);
     if (_japaneseHolidays.containsKey(_dateKeyString(date))) return true;
@@ -465,28 +539,69 @@ class _CalendarScreenState extends State<CalendarScreen>
   Future<void> _scheduleNotification(
     int id,
     String title,
-    DateTime date,
-  ) async {
+    DateTime date, {
+    bool isRecurring = false,
+  }) async {
+    // もし id が 32ビット整数の最大値（2147483647）を超えていたら、安全な範囲に丸める
+    // ※ _cancelNotification と同じ丸め方をしないとID不一致でキャンセルできなくなる
+    int safeId = id;
+    if (id > 2147483647) {
+      safeId = id % 100000000;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     final hour = prefs.getInt('notify_hour') ?? 9;
     final minute = prefs.getInt('notify_minute') ?? 0;
 
-    final scheduledDate = tz.TZDateTime(
+    // 「毎月繰り返す」予定は、休日調整（前倒し/後ろ倒し）を反映した
+    // 実際の対象日で通知したいので、今月分の調整済み日付を求め直す。
+    // ※休日の並びは月によって変わるため、OS側の「毎月同じ日に自動リピート」
+    //   機能は使わず、毎回アプリ側で計算してから one-shot で予約する。
+    DateTime resolvedDate = date;
+    if (isRecurring) {
+      final now = DateTime.now();
+      resolvedDate = _adjustToBusinessDay(
+        _recurringDateForMonth(now.year, now.month, date.day),
+      );
+    }
+
+    var scheduledDate = tz.TZDateTime(
       tz.local,
-      date.year,
-      date.month,
-      date.day,
+      resolvedDate.year,
+      resolvedDate.month,
+      resolvedDate.day,
       hour,
       minute,
     );
-    if (scheduledDate.isBefore(tz.TZDateTime.now(tz.local))) return;
+    if (scheduledDate.isBefore(tz.TZDateTime.now(tz.local))) {
+      if (isRecurring) {
+        // 今月分の（調整済み）日時が既に過ぎている場合は、翌月分を
+        // 同様に調整した上で繰り上げて予約する
+        final now = DateTime.now();
+        final int nextYear = now.month == 12 ? now.year + 1 : now.year;
+        final int nextMonth = now.month == 12 ? 1 : now.month + 1;
+        resolvedDate = _adjustToBusinessDay(
+          _recurringDateForMonth(nextYear, nextMonth, date.day),
+        );
+        scheduledDate = tz.TZDateTime(
+          tz.local,
+          resolvedDate.year,
+          resolvedDate.month,
+          resolvedDate.day,
+          hour,
+          minute,
+        );
+      } else {
+        return;
+      }
+    }
 
     await flutterLocalNotificationsPlugin.zonedSchedule(
-      id,
-      '本日の重要予定',
-      title,
-      scheduledDate,
-      const NotificationDetails(
+      id: safeId,
+      title: '本日の重要予定',
+      body: title,
+      scheduledDate: scheduledDate,
+      notificationDetails: const NotificationDetails(
         android: AndroidNotificationDetails(
           'milestone_channel',
           '重要日の通知',
@@ -496,9 +611,34 @@ class _CalendarScreenState extends State<CalendarScreen>
         iOS: DarwinNotificationDetails(),
       ),
       androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-      uiLocalNotificationDateInterpretation:
-          UILocalNotificationDateInterpretation.absoluteTime,
+      // 「毎月繰り返す」予定は、休日調整の結果が月ごとに変わりうるため
+      // OS側の自動リピートは使わない。翌月分は
+      // _rescheduleRecurringMilestoneNotifications() が月替わりのタイミングで
+      // 呼び出され、その都度この関数で再計算・再予約される。
     );
+  }
+
+  // 「毎月繰り返す」かつ通知ONのマイルストーンについて、休日調整（前倒し/
+  // 後ろ倒し）を反映した今月の対象日で通知を計算し直し、再予約する。
+  // 月が変わったタイミングや、休日設定・調整方向の変更時に呼び出す。
+  Future<void> _rescheduleRecurringMilestoneNotifications() async {
+    for (final m in _milestones) {
+      if (m['isRecurring'] != true || m['isNotify'] != true) continue;
+      final date = m['date'] as DateTime?;
+      if (date == null) continue;
+      final int rawId =
+          (m['id'] as int?) ?? m['title'].toString().hashCode.abs();
+      try {
+        await _scheduleNotification(
+          rawId,
+          m['title'].toString(),
+          date,
+          isRecurring: true,
+        );
+      } catch (e) {
+        debugPrint('繰り返し予定の通知再予約に失敗しました: $e');
+      }
+    }
   }
 
   Future<void> _cancelNotification(int id) async {
@@ -507,7 +647,86 @@ class _CalendarScreenState extends State<CalendarScreen>
     if (id > 2147483647) {
       safeId = id % 100000000;
     }
-    await flutterLocalNotificationsPlugin.cancel(safeId);
+    try {
+      await flutterLocalNotificationsPlugin.cancel(id: safeId);
+    } catch (e) {
+      // 通知プラグイン側の例外で保存・削除フロー全体が止まらないようにする
+      // (特にリリースビルドでは例外が握りつぶされて「無反応」に見えるため)
+      debugPrint('通知のキャンセルに失敗しました (id=$safeId): $e');
+    }
+  }
+
+  // マイルストーンのIDと衝突しないよう予約した固定ID
+  static const int _lastBusinessDayNotificationId = 999999001;
+
+  // 「今月の最終営業日」に達したら通知する。休日設定を反映した上での
+  // 最終営業日を毎回計算し直すため、休日設定や日付が変わるたびに
+  // 呼び出して再予約する。
+  Future<void> _scheduleLastBusinessDayNotification() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool('notify_last_business_day') ?? true;
+
+    // 既存の予約は一旦キャンセルしてから、必要であれば予約し直す
+    try {
+      await flutterLocalNotificationsPlugin.cancel(
+        id: _lastBusinessDayNotificationId,
+      );
+    } catch (e) {
+      debugPrint('最終営業日通知のキャンセルに失敗しました: $e');
+    }
+
+    if (!enabled) return;
+
+    final now = DateTime.now();
+    final lastDayOfThisMonth = DateTime(now.year, now.month + 1, 0);
+    DateTime? lastBusinessDay;
+    for (int day = lastDayOfThisMonth.day; day >= 1; day--) {
+      final candidate = DateTime(now.year, now.month, day);
+      if (!_isOffDay(candidate)) {
+        lastBusinessDay = candidate;
+        break;
+      }
+    }
+    // 万が一その月が全て休日扱いだった場合は何もしない
+    if (lastBusinessDay == null) return;
+
+    final hour = prefs.getInt('notify_hour') ?? 9;
+    final minute = prefs.getInt('notify_minute') ?? 0;
+    final scheduledDate = tz.TZDateTime(
+      tz.local,
+      lastBusinessDay.year,
+      lastBusinessDay.month,
+      lastBusinessDay.day,
+      hour,
+      minute,
+    );
+    // 今月の最終営業日が既に過ぎている場合は、来月分は次回の呼び出し
+    // （月が変わったタイミング等）で改めて計算されるのでここでは何もしない
+    if (scheduledDate.isBefore(tz.TZDateTime.now(tz.local))) return;
+
+    try {
+      await flutterLocalNotificationsPlugin.zonedSchedule(
+        id: _lastBusinessDayNotificationId,
+        title: 'ノコリカ',
+        body: '本日は今月の最終営業日です',
+        scheduledDate: scheduledDate,
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'milestone_channel',
+            '重要日の通知',
+            importance: Importance.max,
+            priority: Priority.high,
+          ),
+          iOS: DarwinNotificationDetails(
+            presentAlert: true,
+            presentSound: true,
+          ),
+        ),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      );
+    } catch (e) {
+      debugPrint('最終営業日通知の予約に失敗しました: $e');
+    }
   }
 
   @override
@@ -555,6 +774,7 @@ class _CalendarScreenState extends State<CalendarScreen>
                     ? _buildTimelineView()
                     : Column(
                         children: [
+                          _buildOverdueBanner(),
                           KeyedSubtree(
                             key: _tutorialTopCardsKey,
                             child: _buildTopCards(count, lastBD),
@@ -604,6 +824,72 @@ class _CalendarScreenState extends State<CalendarScreen>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildOverdueBanner() {
+    final overdue = _overdueMilestones();
+    if (overdue.isEmpty || _overdueBannerDismissed) {
+      return const SizedBox.shrink();
+    }
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final titles = overdue.map((m) => m['title'].toString()).toList();
+    final displayTitles = titles.length <= 3
+        ? titles.join('、')
+        : '${titles.take(3).join('、')} 他${titles.length - 3}件';
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isDark
+            ? Colors.red.withOpacity(0.15)
+            : Colors.red.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.redAccent.withOpacity(0.5)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.error_outline, color: Colors.redAccent, size: 20),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '期限を超過している予定が${overdue.length}件あります',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.redAccent,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  displayTitles,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: isDark ? Colors.grey[300] : Colors.black87,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                const Text(
+                  '該当のカードを長押しすると日付を変更できます',
+                  style: TextStyle(fontSize: 11, color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(),
+            icon: const Icon(Icons.close, size: 18, color: Colors.grey),
+            onPressed: () => setState(() => _overdueBannerDismissed = true),
+          ),
+        ],
       ),
     );
   }
@@ -1056,17 +1342,27 @@ class _CalendarScreenState extends State<CalendarScreen>
                         includeWeekends: _includeWeekends,
                         fixedHolidays: _fixedHolidays,
                         milestones: _milestones,
-                        onChanged: (newInclude, newFixed) {
+                        holidayAdjustDirection: _holidayAdjustDirection,
+                        onChanged: (newInclude, newFixed, newDirection) {
                           setState(() {
                             _includeWeekends = newInclude;
                             _fixedHolidays = newFixed;
+                            _holidayAdjustDirection = newDirection;
                           });
                           _saveData();
                         },
+                        resolveRecurringOccurrence: (y, m, d) =>
+                            _adjustToBusinessDay(
+                              _recurringDateForMonth(y, m, d),
+                            ),
                       ),
                     ),
                   );
                   setState(() {});
+                  // 設定画面で「最終営業日に通知する」等が変更された可能性があるため
+                  // 戻ってきたタイミングで必ず再計算・再予約する
+                  _scheduleLastBusinessDayNotification();
+                  _rescheduleRecurringMilestoneNotifications();
                 },
               ),
             ],
@@ -1077,6 +1373,7 @@ class _CalendarScreenState extends State<CalendarScreen>
   }
 
   Widget _buildTimelineView() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     final today = DateTime(
       DateTime.now().year,
       DateTime.now().month,
@@ -1196,7 +1493,9 @@ class _CalendarScreenState extends State<CalendarScreen>
                                       ? Colors.blue
                                       : (date.weekday == 7
                                             ? Colors.red
-                                            : Colors.black87)),
+                                            : (isDark
+                                                  ? Colors.white
+                                                  : Colors.black87))),
                           ),
                         ),
                       ),
@@ -1543,7 +1842,7 @@ class _CalendarScreenState extends State<CalendarScreen>
               var milestone = entry.value;
               DateTime targetDate = milestone['isRecurring'] == true
                   ? _adjustToBusinessDay(
-                      DateTime(
+                      _recurringDateForMonth(
                         _focusedDay.year,
                         _focusedDay.month,
                         milestone['date'].day,
@@ -1722,7 +2021,11 @@ class _CalendarScreenState extends State<CalendarScreen>
       var m = _milestones[_currentPageIndex - 1];
       activeCardDate = m['isRecurring'] == true
           ? _adjustToBusinessDay(
-              DateTime(_focusedDay.year, _focusedDay.month, m['date'].day),
+              _recurringDateForMonth(
+                _focusedDay.year,
+                _focusedDay.month,
+                m['date'].day,
+              ),
             )
           : m['date'];
       activeColor = _milestoneCardColor(m);
@@ -2685,7 +2988,7 @@ class _CalendarScreenState extends State<CalendarScreen>
     }
     final DateTime targetDate = milestone['isRecurring'] == true
         ? _adjustToBusinessDay(
-            DateTime(
+            _recurringDateForMonth(
               _focusedDay.year,
               _focusedDay.month,
               milestone['date'].day,
@@ -2703,10 +3006,24 @@ class _CalendarScreenState extends State<CalendarScreen>
 
   DateTime _adjustToBusinessDay(DateTime date) {
     DateTime adjusted = date;
+    final Duration step =
+        _holidayAdjustDirection == HolidayAdjustDirection.postpone
+        ? const Duration(days: 1)
+        : const Duration(days: -1);
     while (_isOffDay(adjusted)) {
-      adjusted = adjusted.add(const Duration(days: 1));
+      adjusted = adjusted.add(step);
     }
     return adjusted;
+  }
+
+  // 「毎月繰り返す」予定の、指定した年月における実際の日付を求める。
+  // 例えば31日を指定していても、その月が30日までしか無ければ
+  // 月末（30日）にクランプする。（そのままDateTime(year, month, 31)を
+  // 作ると、Dartの仕様で自動的に翌月1日に繰り上がってしまうため）
+  DateTime _recurringDateForMonth(int year, int month, int day) {
+    final lastDayOfMonth = DateTime(year, month + 1, 0).day;
+    final clampedDay = day > lastDayOfMonth ? lastDayOfMonth : day;
+    return DateTime(year, month, clampedDay);
   }
 
   static const List<Color> _milestoneColorPalette = [
@@ -2920,15 +3237,22 @@ class _CalendarScreenState extends State<CalendarScreen>
 
                   setState(() => _milestones.add(newMilestone));
                   _saveMilestones();
+                  _maybeRequestReview();
 
                   if (isNotify) {
-                    await _scheduleNotification(
-                      uniqueId,
-                      _milestoneTitleController.text,
-                      targetDate,
-                    );
+                    try {
+                      await _scheduleNotification(
+                        uniqueId,
+                        _milestoneTitleController.text,
+                        targetDate,
+                        isRecurring: isRecurring,
+                      );
+                    } catch (e) {
+                      // 通知登録に失敗しても保存自体は成立させ、モーダルは必ず閉じる
+                      debugPrint('通知の登録に失敗しました: $e');
+                    }
                   }
-                  Navigator.pop(context);
+                  if (context.mounted) Navigator.pop(context);
                 },
                 child: const Text("追加"),
               ),
@@ -3056,13 +3380,19 @@ class _CalendarScreenState extends State<CalendarScreen>
                   _saveMilestones();
 
                   if (isNotify) {
-                    await _scheduleNotification(
-                      uniqueId,
-                      _milestoneTitleController.text,
-                      targetDate,
-                    );
-                    Navigator.pop(context);
+                    try {
+                      await _scheduleNotification(
+                        uniqueId,
+                        _milestoneTitleController.text,
+                        targetDate,
+                        isRecurring: isRecurring,
+                      );
+                    } catch (e) {
+                      // 通知登録に失敗しても保存自体は成立させ、モーダルは必ず閉じる
+                      debugPrint('通知の登録に失敗しました: $e');
+                    }
                   }
+                  if (context.mounted) Navigator.pop(context);
                 },
                 child: const Text("保存"),
               ),
@@ -3130,78 +3460,81 @@ class _SearchScreenState extends State<SearchScreen> {
           onChanged: (val) => setState(() => _query = val),
         ),
       ),
-      body: _query.isEmpty
-          ? const Center(child: Text('キーワードを入力してください'))
-          : ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                if (milestoneResults.isNotEmpty) ...[
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text(
-                      '重要日',
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ),
-                  ...milestoneResults.map(
-                    (m) => Card(
-                      child: ListTile(
-                        leading: const Icon(Icons.star, color: Colors.amber),
-                        title: Text(m['title']),
-                        subtitle: Text(
-                          '${m['date'].year}/${m['date'].month}/${m['date'].day}',
-                        ),
-                        onTap: () => Navigator.pop(context, m['date']),
-                      ),
-                    ),
-                  ),
-                ],
-                if (dayResults.isNotEmpty) ...[
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text(
-                      '予定・メモ',
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ),
-                  ...dayResults.map(
-                    (e) => Card(
-                      child: ListTile(
-                        leading: const Icon(
-                          Icons.event_note,
-                          color: Colors.blueAccent,
-                        ),
-                        title: Text('${e.key.month}/${e.key.day}'),
-                        subtitle: Text(
-                          e.value.tasks.isNotEmpty
-                              ? e.value.tasks.map((t) => t.text).join('、')
-                              : e.value.memo,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        onTap: () => Navigator.pop(context, e.key),
-                      ),
-                    ),
-                  ),
-                ],
-                if (milestoneResults.isEmpty && dayResults.isEmpty)
-                  const Center(
-                    child: Padding(
-                      padding: EdgeInsets.only(top: 40),
+      body: SafeArea(
+        top: false,
+        child: _query.isEmpty
+            ? const Center(child: Text('キーワードを入力してください'))
+            : ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  if (milestoneResults.isNotEmpty) ...[
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
                       child: Text(
-                        '該当する項目が見つかりません',
-                        style: TextStyle(color: Colors.grey),
+                        '重要日',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                        ),
                       ),
                     ),
-                  ),
-              ],
-            ),
+                    ...milestoneResults.map(
+                      (m) => Card(
+                        child: ListTile(
+                          leading: const Icon(Icons.star, color: Colors.amber),
+                          title: Text(m['title']),
+                          subtitle: Text(
+                            '${m['date'].year}/${m['date'].month}/${m['date'].day}',
+                          ),
+                          onTap: () => Navigator.pop(context, m['date']),
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (dayResults.isNotEmpty) ...[
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
+                      child: Text(
+                        '予定・メモ',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                    ...dayResults.map(
+                      (e) => Card(
+                        child: ListTile(
+                          leading: const Icon(
+                            Icons.event_note,
+                            color: Colors.blueAccent,
+                          ),
+                          title: Text('${e.key.month}/${e.key.day}'),
+                          subtitle: Text(
+                            e.value.tasks.isNotEmpty
+                                ? e.value.tasks.map((t) => t.text).join('、')
+                                : e.value.memo,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          onTap: () => Navigator.pop(context, e.key),
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (milestoneResults.isEmpty && dayResults.isEmpty)
+                    const Center(
+                      child: Padding(
+                        padding: EdgeInsets.only(top: 40),
+                        child: Text(
+                          '該当する項目が見つかりません',
+                          style: TextStyle(color: Colors.grey),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+      ),
     );
   }
 }
@@ -3210,14 +3543,21 @@ class SettingsScreen extends StatefulWidget {
   final bool includeWeekends;
   final List<FixedHoliday> fixedHolidays;
   final List<Map<String, dynamic>> milestones;
-  final Function(bool, List<FixedHoliday>) onChanged;
+  final HolidayAdjustDirection holidayAdjustDirection;
+  final Function(bool, List<FixedHoliday>, HolidayAdjustDirection) onChanged;
+  // 「毎月繰り返す」予定の、指定した年月における休日調整済みの実際の対象日を
+  // 求めるための関数（親画面の休日設定・調整方向を反映するため呼び出す）
+  final DateTime Function(int year, int month, int day)
+  resolveRecurringOccurrence;
 
   const SettingsScreen({
     super.key,
     required this.includeWeekends,
     required this.fixedHolidays,
     required this.milestones,
+    required this.holidayAdjustDirection,
     required this.onChanged,
+    required this.resolveRecurringOccurrence,
   });
 
   @override
@@ -3227,14 +3567,17 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _tempIncludeWeekends;
   late List<FixedHoliday> _tempFixedHolidays;
+  late HolidayAdjustDirection _tempHolidayAdjustDirection;
   int _notifyHour = 9;
   int _notifyMinute = 0;
+  bool _notifyLastBusinessDay = true;
 
   @override
   void initState() {
     super.initState();
     _tempIncludeWeekends = widget.includeWeekends;
     _tempFixedHolidays = List.from(widget.fixedHolidays);
+    _tempHolidayAdjustDirection = widget.holidayAdjustDirection;
     _loadNotifyTime();
   }
 
@@ -3243,6 +3586,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       _notifyHour = prefs.getInt('notify_hour') ?? 9;
       _notifyMinute = prefs.getInt('notify_minute') ?? 0;
+      _notifyLastBusinessDay =
+          prefs.getBool('notify_last_business_day') ?? true;
     });
   }
 
@@ -3252,7 +3597,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     await showModalBottomSheet(
       context: context,
-      builder: (context) => Column(
+      builder: (sheetContext) => Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Padding(
@@ -3261,7 +3606,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 TextButton(
-                  onPressed: () => Navigator.pop(context),
+                  onPressed: () => Navigator.pop(sheetContext),
                   child: const Text('キャンセル'),
                 ),
                 const Text(
@@ -3270,67 +3615,129 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 TextButton(
                   onPressed: () async {
-                    Navigator.pop(context);
                     final prefs = await SharedPreferences.getInstance();
                     await prefs.setInt('notify_hour', tempHour);
                     await prefs.setInt('notify_minute', tempMinute);
                     // 既存の全通知をキャンセルして新しい時刻で再予約
-                    await flutterLocalNotificationsPlugin.cancelAll();
+                    try {
+                      await flutterLocalNotificationsPlugin.cancelAll();
+                    } catch (e) {
+                      // 端末内に破損した予約データが残っていると、ここで
+                      // "Missing type parameter" 等の例外が出ることがある。
+                      // その場合でも以降の再予約処理は続行する。
+                      debugPrint('通知の一括キャンセルに失敗しました: $e');
+                    }
                     int rescheduled = 0;
+                    int skippedPast = 0;
                     for (final m in widget.milestones) {
                       if (m['isNotify'] != true) continue;
                       final date = m['date'] as DateTime?;
                       if (date == null) continue;
-                      final scheduledDate = tz.TZDateTime(
+                      final isRecurring = m['isRecurring'] == true;
+
+                      // 「毎月繰り返す」予定は、休日調整（前倒し/後ろ倒し）を
+                      // 反映した今月の対象日を使う。休日の並びは月によって
+                      // 変わるため、OS側の自動リピートは使わず one-shot で
+                      // 予約し、翌月分は月替わりのタイミングで別途再予約する。
+                      final now = tz.TZDateTime.now(tz.local);
+                      DateTime targetDate = isRecurring
+                          ? widget.resolveRecurringOccurrence(
+                              now.year,
+                              now.month,
+                              date.day,
+                            )
+                          : date;
+                      var scheduledDate = tz.TZDateTime(
                         tz.local,
-                        date.year,
-                        date.month,
-                        date.day,
+                        targetDate.year,
+                        targetDate.month,
+                        targetDate.day,
                         tempHour,
                         tempMinute,
                       );
-                      if (scheduledDate.isBefore(tz.TZDateTime.now(tz.local)))
-                        continue;
-                      final id =
+                      if (scheduledDate.isBefore(now)) {
+                        if (isRecurring) {
+                          // 今月分の（調整済み）日時が既に過ぎている場合は
+                          // 翌月分を同様に調整した上で繰り上げて予約する
+                          final int nextYear = now.month == 12
+                              ? now.year + 1
+                              : now.year;
+                          final int nextMonth = now.month == 12
+                              ? 1
+                              : now.month + 1;
+                          targetDate = widget.resolveRecurringOccurrence(
+                            nextYear,
+                            nextMonth,
+                            date.day,
+                          );
+                          scheduledDate = tz.TZDateTime(
+                            tz.local,
+                            targetDate.year,
+                            targetDate.month,
+                            targetDate.day,
+                            tempHour,
+                            tempMinute,
+                          );
+                        } else {
+                          skippedPast++;
+                          continue;
+                        }
+                      }
+                      final rawId =
                           (m['id'] as int?) ??
                           m['title'].toString().hashCode.abs();
-                      await flutterLocalNotificationsPlugin.zonedSchedule(
-                        id,
-                        'ノコリカ',
-                        '【${m['title'].toString()}】は本日期限です',
-                        scheduledDate,
-                        const NotificationDetails(
-                          android: AndroidNotificationDetails(
-                            'milestone_channel',
-                            '重要日の通知',
-                            importance: Importance.max,
-                            priority: Priority.high,
+                      // _scheduleNotification と同じ丸め方でIDを32bit範囲に収める
+                      final id = rawId > 2147483647 ? rawId % 100000000 : rawId;
+                      try {
+                        await flutterLocalNotificationsPlugin.zonedSchedule(
+                          id: id,
+                          title: 'ノコリカ',
+                          body: '【${m['title'].toString()}】は本日期限です',
+                          scheduledDate: scheduledDate,
+                          notificationDetails: const NotificationDetails(
+                            android: AndroidNotificationDetails(
+                              'milestone_channel',
+                              '重要日の通知',
+                              importance: Importance.max,
+                              priority: Priority.high,
+                            ),
+                            iOS: DarwinNotificationDetails(
+                              presentAlert: true,
+                              presentSound: true,
+                            ),
                           ),
-                          iOS: DarwinNotificationDetails(
-                            presentAlert: true,
-                            presentSound: true,
-                          ),
-                        ),
-                        androidScheduleMode:
-                            AndroidScheduleMode.exactAllowWhileIdle,
-                        uiLocalNotificationDateInterpretation:
-                            UILocalNotificationDateInterpretation.absoluteTime,
-                      );
-                      rescheduled++;
+                          androidScheduleMode:
+                              AndroidScheduleMode.exactAllowWhileIdle,
+                          // 休日調整の結果は月ごとに変わりうるため、OS側の
+                          // 自動リピート（matchDateTimeComponents）は使わない
+                        );
+                        rescheduled++;
+                      } catch (e) {
+                        // 1件失敗しても他のマイルストーンの再予約は継続する
+                        debugPrint('通知の再予約に失敗しました (id=$id): $e');
+                      }
                     }
+
+                    // モーダルを閉じるのは、非同期処理が全て終わった後にする
+                    // (先に閉じてしまうと、以降で使う context が無効化され
+                    //  SnackBar表示などが失敗する)
+                    if (sheetContext.mounted) Navigator.pop(sheetContext);
+
+                    if (!mounted) return;
                     setState(() {
                       _notifyHour = tempHour;
                       _notifyMinute = tempMinute;
                     });
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(
-                            '通知時刻を ${tempHour.toString().padLeft(2, '0')}:${tempMinute.toString().padLeft(2, '0')} に変更しました（$rescheduled件再予約）',
-                          ),
+                    final skipNote = skippedPast > 0
+                        ? '（$skippedPast件は日時が過去のためスキップ）'
+                        : '';
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          '通知時刻を ${tempHour.toString().padLeft(2, '0')}:${tempMinute.toString().padLeft(2, '0')} に変更しました（$rescheduled件再予約）$skipNote',
                         ),
-                      );
-                    }
+                      ),
+                    );
                   },
                   child: const Text(
                     '決定',
@@ -3478,156 +3885,316 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          Card(
-            child: Column(
-              children: [
-                SwitchListTile(
-                  title: const Text('土日を営業日に含める'),
-                  subtitle: const Text('カレンダー上でのカウント対象になります'),
-                  value: _tempIncludeWeekends,
-                  onChanged: (val) {
-                    setState(() => _tempIncludeWeekends = val);
-                    widget.onChanged(_tempIncludeWeekends, _tempFixedHolidays);
-                  },
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-            child: Text(
-              '外観設定',
-              style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey),
-            ),
-          ),
-          Card(
-            child: Column(
-              children: [
-                ListTile(
-                  leading: const Icon(Icons.palette_outlined),
-                  title: const Text('テーマカラー変更'),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      ...[
-                        Colors.blueAccent,
-                        Colors.teal,
-                        Colors.deepPurple,
-                        Colors.orange,
-                      ].map(
-                        (c) => GestureDetector(
-                          onTap: () async {
-                            themeColorNotifier.value = c;
-                            final prefs = await SharedPreferences.getInstance();
-                            await prefs.setInt('theme_color', c.value);
-                          },
-                          child: Container(
-                            margin: const EdgeInsets.only(left: 6),
-                            width: 24,
-                            height: 24,
-                            decoration: BoxDecoration(
-                              color: c,
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                ListTile(
-                  leading: const Icon(Icons.dark_mode_outlined),
-                  title: const Text('ダークモード設定'),
-                  trailing: DropdownButton<ThemeMode>(
-                    value: themeModeNotifier.value,
-                    onChanged: (ThemeMode? newMode) async {
-                      if (newMode != null) {
-                        themeModeNotifier.value = newMode;
-                        final prefs = await SharedPreferences.getInstance();
-                        await prefs.setInt('theme_mode', newMode.index);
-                        setState(() {});
-                      }
+      body: SafeArea(
+        top: false,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Card(
+              child: Column(
+                children: [
+                  SwitchListTile(
+                    title: const Text('土日を営業日に含める'),
+                    subtitle: const Text('カレンダー上でのカウント対象になります'),
+                    value: _tempIncludeWeekends,
+                    onChanged: (val) {
+                      setState(() => _tempIncludeWeekends = val);
+                      widget.onChanged(
+                        _tempIncludeWeekends,
+                        _tempFixedHolidays,
+                        _tempHolidayAdjustDirection,
+                      );
                     },
-                    items: const [
-                      DropdownMenuItem(
-                        value: ThemeMode.system,
-                        child: Text('システム連動'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              child: Text(
+                '休日調整',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                ),
+              ),
+            ),
+            Card(
+              child: Column(
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        '「毎月繰り返す」予定の日が休日にあたる場合',
+                        style: TextStyle(fontSize: 13, color: Colors.grey),
                       ),
-                      DropdownMenuItem(
-                        value: ThemeMode.light,
-                        child: Text('ライト'),
-                      ),
-                      DropdownMenuItem(
-                        value: ThemeMode.dark,
-                        child: Text('ダーク'),
-                      ),
-                    ],
+                    ),
                   ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-            child: Text(
-              'データ管理（バックアップ）',
-              style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey),
-            ),
-          ),
-          Card(
-            child: Column(
-              children: [
-                ListTile(
-                  leading: const Icon(Icons.copy_all, color: Colors.blueAccent),
-                  title: const Text('データをエクスポート'),
-                  subtitle: const Text('設定や予定の全データをコピーします'),
-                  onTap: _exportData,
-                ),
-                const Divider(height: 1),
-                ListTile(
-                  leading: const Icon(
-                    Icons.restart_alt,
-                    color: Colors.orangeAccent,
+                  RadioListTile<HolidayAdjustDirection>(
+                    title: const Text('後ろ倒しにする'),
+                    subtitle: const Text('休日でなくなるまで、次の日へずらします'),
+                    value: HolidayAdjustDirection.postpone,
+                    groupValue: _tempHolidayAdjustDirection,
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _tempHolidayAdjustDirection = v);
+                      widget.onChanged(
+                        _tempIncludeWeekends,
+                        _tempFixedHolidays,
+                        _tempHolidayAdjustDirection,
+                      );
+                    },
                   ),
-                  title: const Text('データをインポート（復元）'),
-                  subtitle: const Text('クリップボードからデータを読み込みます'),
-                  onTap: _importData,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-            child: Text(
-              '通知設定',
-              style: TextStyle(fontSize: 13, color: Colors.grey),
-            ),
-          ),
-          Card(
-            child: Column(
-              children: [
-                ListTile(
-                  leading: const Icon(
-                    Icons.access_time,
-                    color: Colors.blueAccent,
+                  RadioListTile<HolidayAdjustDirection>(
+                    title: const Text('前倒しにする'),
+                    subtitle: const Text('休日でなくなるまで、前の日へずらします'),
+                    value: HolidayAdjustDirection.advance,
+                    groupValue: _tempHolidayAdjustDirection,
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _tempHolidayAdjustDirection = v);
+                      widget.onChanged(
+                        _tempIncludeWeekends,
+                        _tempFixedHolidays,
+                        _tempHolidayAdjustDirection,
+                      );
+                    },
                   ),
-                  title: const Text('通知時刻'),
-                  subtitle: Text(
-                    '${_notifyHour.toString().padLeft(2, '0')}:${_notifyMinute.toString().padLeft(2, '0')}',
-                  ),
-                  onTap: _showTimerPicker,
-                ),
-              ],
+                ],
+              ),
             ),
+            const SizedBox(height: 12),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              child: Text(
+                '外観設定',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                ),
+              ),
+            ),
+            Card(
+              child: Column(
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.dark_mode_outlined),
+                    title: const Text('ダークモード設定'),
+                    trailing: DropdownButton<ThemeMode>(
+                      value: themeModeNotifier.value,
+                      onChanged: (ThemeMode? newMode) async {
+                        if (newMode != null) {
+                          themeModeNotifier.value = newMode;
+                          final prefs = await SharedPreferences.getInstance();
+                          await prefs.setInt('theme_mode', newMode.index);
+                          setState(() {});
+                        }
+                      },
+                      items: const [
+                        DropdownMenuItem(
+                          value: ThemeMode.system,
+                          child: Text('システム連動'),
+                        ),
+                        DropdownMenuItem(
+                          value: ThemeMode.light,
+                          child: Text('ライト'),
+                        ),
+                        DropdownMenuItem(
+                          value: ThemeMode.dark,
+                          child: Text('ダーク'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              child: Text(
+                'データ管理（バックアップ）',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                ),
+              ),
+            ),
+            Card(
+              child: Column(
+                children: [
+                  ListTile(
+                    leading: const Icon(
+                      Icons.copy_all,
+                      color: Colors.blueAccent,
+                    ),
+                    title: const Text('データをエクスポート'),
+                    subtitle: const Text('設定や予定の全データをコピーします'),
+                    onTap: _exportData,
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(
+                      Icons.restart_alt,
+                      color: Colors.orangeAccent,
+                    ),
+                    title: const Text('データをインポート（復元）'),
+                    subtitle: const Text('クリップボードからデータを読み込みます'),
+                    onTap: _importData,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              child: Text(
+                '通知設定',
+                style: TextStyle(fontSize: 13, color: Colors.grey),
+              ),
+            ),
+            Card(
+              child: Column(
+                children: [
+                  ListTile(
+                    leading: const Icon(
+                      Icons.access_time,
+                      color: Colors.blueAccent,
+                    ),
+                    title: const Text('通知時刻'),
+                    subtitle: Text(
+                      '${_notifyHour.toString().padLeft(2, '0')}:${_notifyMinute.toString().padLeft(2, '0')}',
+                    ),
+                    onTap: _showTimerPicker,
+                  ),
+                  const Divider(height: 1),
+                  SwitchListTile(
+                    secondary: const Icon(
+                      Icons.event_available,
+                      color: Colors.blueAccent,
+                    ),
+                    title: const Text('最終営業日に通知する'),
+                    subtitle: const Text('その月の最終営業日になったら通知'),
+                    value: _notifyLastBusinessDay,
+                    onChanged: (v) async {
+                      setState(() => _notifyLastBusinessDay = v);
+                      final prefs = await SharedPreferences.getInstance();
+                      await prefs.setBool('notify_last_business_day', v);
+                    },
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(
+                      Icons.notifications_active_outlined,
+                      color: Colors.teal,
+                    ),
+                    title: const Text('通知が届かない場合の確認'),
+                    subtitle: const Text('通知・アラーム権限の状態をチェック'),
+                    onTap: _checkNotificationPermissions,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // 実機で通知が届かない時の切り分け用。
+  // 「通知の許可」と「正確なアラームの許可」は requestXxxPermission() を
+  // 呼んでも、実機側でユーザーが手動でONにしないと有効にならないことがあるため、
+  // 現在の許可状態をその場で確認できるようにする。
+  Future<void> _checkNotificationPermissions() async {
+    final androidImplementation = flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    if (androidImplementation == null) return;
+
+    bool? notificationsEnabled;
+    bool? exactAlarmsEnabled;
+    try {
+      notificationsEnabled = await androidImplementation
+          .areNotificationsEnabled();
+    } catch (e) {
+      debugPrint('areNotificationsEnabled 取得失敗: $e');
+    }
+    try {
+      exactAlarmsEnabled = await androidImplementation
+          .canScheduleExactNotifications();
+    } catch (e) {
+      debugPrint('canScheduleExactNotifications 取得失敗: $e');
+    }
+
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('通知権限の状態'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _permissionStatusRow('通知の許可', notificationsEnabled),
+            const SizedBox(height: 8),
+            _permissionStatusRow('正確なアラームの許可', exactAlarmsEnabled),
+            const SizedBox(height: 16),
+            const Text(
+              'いずれかが「未許可」の場合は、端末の設定アプリからこのアプリの'
+              '通知・アラームとリマインダーを手動でONにしてください。',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('閉じる'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              // 通知が未許可なら再度リクエストダイアログを出す
+              if (notificationsEnabled != true) {
+                await androidImplementation.requestNotificationsPermission();
+              }
+              // 正確なアラームが未許可ならOS設定画面を開く
+              if (exactAlarmsEnabled != true) {
+                await androidImplementation.requestExactAlarmsPermission();
+              }
+            },
+            child: const Text('設定を開く'),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _permissionStatusRow(String label, bool? enabled) {
+    final isOk = enabled == true;
+    return Row(
+      children: [
+        Icon(
+          isOk ? Icons.check_circle : Icons.cancel,
+          color: isOk ? Colors.green : Colors.redAccent,
+          size: 18,
+        ),
+        const SizedBox(width: 8),
+        Text(label),
+        const Spacer(),
+        Text(
+          enabled == null ? '取得不可' : (isOk ? '許可済み' : '未許可'),
+          style: TextStyle(
+            color: isOk ? Colors.green : Colors.redAccent,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
     );
   }
 }
