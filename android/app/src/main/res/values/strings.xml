@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ノコリカ</string>
+    <string name="widget_app_name">ノコリカ</string>
+    <string name="widget_description">今月の残り営業日と最終営業日を表示します</string>
+    <string name="widget_remaining_label">残り営業日</string>
+    <string name="widget_last_business_day">最終営業日: %1$s</string>
+    <string name="widget_open_app_hint">アプリを開いて同期</string>
+</resources>

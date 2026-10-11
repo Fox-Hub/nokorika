@@ -11,3 +11,7 @@
 # 壊れないようにする一般的なルール
 -keepattributes Signature
 -keepattributes *Annotation*
+
+# home_widget がクラス名文字列から AppWidgetProvider を解決するため保持する
+-keep class com.nokorikastudio.nokorika.NokorikaWidgetProvider { *; }
+-keep class es.antonborri.home_widget.** { *; }

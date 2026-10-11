@@ -11,6 +11,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:in_app_review/in_app_review.dart';
 import 'tutorial_overlay.dart';
+import 'widget_sync.dart';
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
@@ -292,6 +293,7 @@ class _CalendarScreenState extends State<CalendarScreen>
       _scheduleLastBusinessDayNotification();
       _rescheduleRecurringMilestoneNotifications();
     }
+    _syncHomeWidget();
   }
 
   /// 初回起動時のみ、画面を暗転させてハイライトするチュートリアルを表示する
@@ -349,6 +351,7 @@ class _CalendarScreenState extends State<CalendarScreen>
       // 祝日データが揃ったので、最終営業日通知を計算し直す
       _scheduleLastBusinessDayNotification();
       _rescheduleRecurringMilestoneNotifications();
+      _syncHomeWidget();
     }
   }
 
@@ -399,6 +402,7 @@ class _CalendarScreenState extends State<CalendarScreen>
     // ずれる可能性があるため計算し直す
     _scheduleLastBusinessDayNotification();
     _rescheduleRecurringMilestoneNotifications();
+    _syncHomeWidget();
   }
 
   Future<void> _saveMilestones() async {
@@ -490,10 +494,33 @@ class _CalendarScreenState extends State<CalendarScreen>
     // 休日設定・weekend設定が揃ったので、最終営業日通知を計算し直す
     _scheduleLastBusinessDayNotification();
     _rescheduleRecurringMilestoneNotifications();
+    _syncHomeWidget();
   }
 
   String _dateKeyString(DateTime date) =>
       '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+
+  /// 指定年月の営業日一覧を返す（カード表示・ウィジェット同期の共通計算）
+  List<DateTime> _businessDaysForMonth(int year, int month) {
+    final firstDayOfMonth = DateTime(year, month, 1);
+    final lastDayOfMonth = DateTime(year, month + 1, 0);
+    final businessDays = <DateTime>[];
+    for (int i = 0; i < lastDayOfMonth.day; i++) {
+      final day = firstDayOfMonth.add(Duration(days: i));
+      if (!_isOffDay(day)) businessDays.add(day);
+    }
+    return businessDays;
+  }
+
+  /// ホーム画面ウィジェットへ今月の残り営業日データを同期する
+  Future<void> _syncHomeWidget() async {
+    final now = DateTime.now();
+    final businessDays = _businessDaysForMonth(now.year, now.month);
+    await WidgetSync.syncRemainingBusinessDays(
+      businessDays: businessDays,
+      month: now,
+    );
+  }
 
   bool _isOffDay(DateTime day) {
     final date = DateTime(day.year, day.month, day.day);
@@ -732,18 +759,15 @@ class _CalendarScreenState extends State<CalendarScreen>
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    DateTime firstDayOfMonth = DateTime(_focusedDay.year, _focusedDay.month, 1);
-    DateTime lastDayOfMonth = DateTime(
+    final List<DateTime> businessDays = _businessDaysForMonth(
+      _focusedDay.year,
+      _focusedDay.month,
+    );
+    final DateTime lastDayOfMonth = DateTime(
       _focusedDay.year,
       _focusedDay.month + 1,
       0,
     );
-
-    List<DateTime> businessDays = [];
-    for (int i = 0; i < lastDayOfMonth.day; i++) {
-      DateTime day = firstDayOfMonth.add(Duration(days: i));
-      if (!_isOffDay(day)) businessDays.add(day);
-    }
 
     DateTime lastBD = businessDays.isNotEmpty
         ? businessDays.last
@@ -3907,6 +3931,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     },
                   ),
                 ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              child: Text(
+                'ウィジェット',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                ),
+              ),
+            ),
+            const Card(
+              child: ListTile(
+                leading: Icon(Icons.widgets_outlined, color: Colors.blueAccent),
+                title: Text('ホーム画面ウィジェット'),
+                subtitle: Text(
+                  'ホーム画面を長押し → ウィジェット から「残り営業日」を追加できます',
+                ),
               ),
             ),
             const SizedBox(height: 12),
