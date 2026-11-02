@@ -11,6 +11,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:in_app_review/in_app_review.dart';
 import 'tutorial_overlay.dart';
+import 'update_checker.dart';
 import 'widget_sync.dart';
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -246,7 +247,15 @@ class _CalendarScreenState extends State<CalendarScreen>
     _loadData();
     _loadHolidays();
     // 対象ウィジェットの初回描画が終わった後にチュートリアルを判定・表示する
-    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeShowTutorial());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _maybeShowTutorial();
+      // 初回チュートリアルと重ならないよう、表示済みのときだけ更新確認する
+      if (!mounted) return;
+      final tutorialShown = await TutorialManager.isShown('calendar_home_v1');
+      if (tutorialShown && mounted) {
+        await UpdateChecker.maybePrompt(context);
+      }
+    });
   }
 
   @override
