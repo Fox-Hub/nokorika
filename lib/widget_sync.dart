@@ -4,17 +4,29 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:home_widget/home_widget.dart';
 
-/// Android ホームウィジェットへ今月の残り営業日データを同期する。
+/// ホームウィジェットへ今月の残り営業日データを同期する。
 ///
 /// 日付またぎでもアプリ未起動で数字が追従するよう、
 /// 「日付 → その日時点の残り営業日」マップを渡す。
+/// Android: [androidWidgetName] / iOS: [iosWidgetName]（Widget Extension 側の kind）
 class WidgetSync {
   static const String androidWidgetName = 'NokorikaWidgetProvider';
+  static const String iosWidgetName = 'NokorikaWidget';
+  static const String iosAppGroupId = 'group.com.nokorikastudio.nokorika';
 
   static const String keyRemainingByDate = 'remaining_by_date';
   static const String keyLastBusinessDay = 'last_business_day';
   static const String keyMonthLabel = 'month_label';
   static const String keyMonthKey = 'month_key';
+  static const String keyTotalBusinessDays = 'total_business_days';
+
+  static bool _appGroupReady = false;
+
+  static Future<void> _ensureAppGroup() async {
+    if (_appGroupReady || kIsWeb || !Platform.isIOS) return;
+    await HomeWidget.setAppGroupId(iosAppGroupId);
+    _appGroupReady = true;
+  }
 
   /// [businessDays] は対象月の営業日一覧（昇順想定）。
   /// [month] はその月の任意日（通常は今日）。
@@ -26,6 +38,8 @@ class WidgetSync {
     if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) return;
 
     try {
+      await _ensureAppGroup();
+
       final year = month.year;
       final monthNum = month.month;
       final lastDayOfMonth = DateTime(year, monthNum + 1, 0).day;
@@ -58,8 +72,15 @@ class WidgetSync {
         keyMonthKey,
         '${year.toString().padLeft(4, '0')}-${monthNum.toString().padLeft(2, '0')}',
       );
+      await HomeWidget.saveWidgetData<int>(
+        keyTotalBusinessDays,
+        businessDays.length,
+      );
 
-      await HomeWidget.updateWidget(name: androidWidgetName);
+      await HomeWidget.updateWidget(
+        name: androidWidgetName,
+        iOSName: iosWidgetName,
+      );
     } catch (e) {
       debugPrint('ウィジェット同期に失敗しました: $e');
     }

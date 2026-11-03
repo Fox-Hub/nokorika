@@ -10,6 +10,7 @@ import 'holiday_service.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:in_app_review/in_app_review.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'tutorial_overlay.dart';
 import 'update_checker.dart';
 import 'widget_sync.dart';
@@ -49,6 +50,19 @@ Future<void> main() async {
   if (androidImplementation != null) {
     await androidImplementation.requestNotificationsPermission();
     await androidImplementation.requestExactAlarmsPermission();
+  }
+
+  final IOSFlutterLocalNotificationsPlugin? iosImplementation =
+      flutterLocalNotificationsPlugin
+          .resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin
+          >();
+  if (iosImplementation != null) {
+    await iosImplementation.requestPermissions(
+      alert: true,
+      badge: true,
+      sound: true,
+    );
   }
 
   final prefs = await SharedPreferences.getInstance();
@@ -822,7 +836,7 @@ class _CalendarScreenState extends State<CalendarScreen>
                           Padding(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 20,
-                              vertical: 8,
+                              vertical: 4,
                             ),
                             child: Row(
                               children: [
@@ -1261,144 +1275,132 @@ class _CalendarScreenState extends State<CalendarScreen>
     );
   }
 
+  ButtonStyle get _headerIconStyle => IconButton.styleFrom(
+    padding: const EdgeInsets.all(6),
+    minimumSize: const Size(36, 36),
+    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    visualDensity: VisualDensity.compact,
+  );
+
   Widget _buildHeader() {
     return Padding(
-      // 左右の余白を 20 から 12 に少し狭めてスペースを確保
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        // 年月・矢印・アクションを横いっぱいに等間隔配置
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
-          // 左側：年月切り替え部分を Expanded で囲み、はみ出しを防止
-          Expanded(
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.chevron_left),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                  onPressed: () => setState(
-                    () => _focusedDay = DateTime(
-                      _focusedDay.year,
-                      _focusedDay.month - 1,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 4),
-                // 万が一画面幅が狭くても文字が潰れないようFlexibleで保護
-                Flexible(
-                  child: Text(
-                    '${_focusedDay.year}/${_focusedDay.month}',
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.blueGrey,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                  ),
-                ),
-                const SizedBox(width: 4),
-                IconButton(
-                  icon: const Icon(Icons.chevron_right),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                  onPressed: () => setState(
-                    () => _focusedDay = DateTime(
-                      _focusedDay.year,
-                      _focusedDay.month + 1,
-                    ),
-                  ),
-                ),
-              ],
+          IconButton(
+            style: _headerIconStyle,
+            icon: const Icon(Icons.chevron_left, size: 28),
+            onPressed: () => setState(
+              () => _focusedDay = DateTime(
+                _focusedDay.year,
+                _focusedDay.month - 1,
+              ),
             ),
           ),
-          const SizedBox(width: 8),
-          // 右側：アクションボタン（ここは元のサイズを維持）
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              IconButton(
-                key: _tutorialSearchKey,
-                icon: const Icon(Icons.search_rounded, size: 24),
-                tooltip: '検索',
-                onPressed: () async {
-                  final DateTime? jumpTo = await Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => SearchScreen(
-                        holidayConfigs: _holidayConfigs,
-                        milestones: _milestones,
-                      ),
-                    ),
-                  );
-                  if (jumpTo != null) {
-                    setState(() {
-                      _focusedDay = DateTime(jumpTo.year, jumpTo.month);
-                      _needsScrollToToday = true;
-                    });
-                  }
-                },
+          Text(
+            '${_focusedDay.year}/${_focusedDay.month}',
+            style: const TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+              color: Colors.blueGrey,
+              height: 1.1,
+            ),
+            maxLines: 1,
+          ),
+          IconButton(
+            style: _headerIconStyle,
+            icon: const Icon(Icons.chevron_right, size: 28),
+            onPressed: () => setState(
+              () => _focusedDay = DateTime(
+                _focusedDay.year,
+                _focusedDay.month + 1,
               ),
-              IconButton(
-                key: _tutorialTodayKey,
-                icon: const Icon(Icons.today_rounded, size: 22),
-                tooltip: '今日に戻る',
-                onPressed: () => setState(() {
-                  _focusedDay = DateTime.now();
-                  _needsScrollToToday = true;
-                }),
-              ),
-              IconButton(
-                key: _tutorialViewToggleKey,
-                icon: Icon(
-                  _isTimelineMode
-                      ? Icons
-                            .calendar_month_rounded // タイムライン中は「カレンダーアイコン」
-                      : Icons.format_list_bulleted_rounded, // カレンダー中は「リストアイコン」
-                  size: 24,
+            ),
+          ),
+          IconButton(
+            key: _tutorialSearchKey,
+            style: _headerIconStyle,
+            icon: const Icon(Icons.search_rounded, size: 22),
+            tooltip: '検索',
+            onPressed: () async {
+              final DateTime? jumpTo = await Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => SearchScreen(
+                    holidayConfigs: _holidayConfigs,
+                    milestones: _milestones,
+                  ),
                 ),
-                tooltip: _isTimelineMode ? 'カレンダー表示' : 'タイムライン表示',
-                onPressed: () {
-                  setState(() {
-                    _isTimelineMode = !_isTimelineMode;
-                  });
-                },
-              ),
-              IconButton(
-                icon: const Icon(Icons.settings_rounded, size: 26),
-                onPressed: () async {
-                  await Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => SettingsScreen(
-                        includeWeekends: _includeWeekends,
-                        fixedHolidays: _fixedHolidays,
-                        milestones: _milestones,
-                        holidayAdjustDirection: _holidayAdjustDirection,
-                        onChanged: (newInclude, newFixed, newDirection) {
-                          setState(() {
-                            _includeWeekends = newInclude;
-                            _fixedHolidays = newFixed;
-                            _holidayAdjustDirection = newDirection;
-                          });
-                          _saveData();
-                        },
-                        resolveRecurringOccurrence: (y, m, d) =>
-                            _adjustToBusinessDay(
-                              _recurringDateForMonth(y, m, d),
-                            ),
-                      ),
-                    ),
-                  );
-                  setState(() {});
-                  // 設定画面で「最終営業日に通知する」等が変更された可能性があるため
-                  // 戻ってきたタイミングで必ず再計算・再予約する
-                  _scheduleLastBusinessDayNotification();
-                  _rescheduleRecurringMilestoneNotifications();
-                },
-              ),
-            ],
+              );
+              if (jumpTo != null) {
+                setState(() {
+                  _focusedDay = DateTime(jumpTo.year, jumpTo.month);
+                  _needsScrollToToday = true;
+                });
+              }
+            },
+          ),
+          IconButton(
+            key: _tutorialTodayKey,
+            style: _headerIconStyle,
+            icon: const Icon(Icons.today_rounded, size: 20),
+            tooltip: '今日に戻る',
+            onPressed: () => setState(() {
+              _focusedDay = DateTime.now();
+              _needsScrollToToday = true;
+            }),
+          ),
+          IconButton(
+            key: _tutorialViewToggleKey,
+            style: _headerIconStyle,
+            icon: Icon(
+              _isTimelineMode
+                  ? Icons.calendar_month_rounded
+                  : Icons.format_list_bulleted_rounded,
+              size: 22,
+            ),
+            tooltip: _isTimelineMode ? 'カレンダー表示' : 'タイムライン表示',
+            onPressed: () {
+              setState(() {
+                _isTimelineMode = !_isTimelineMode;
+              });
+            },
+          ),
+          IconButton(
+            style: _headerIconStyle,
+            icon: const Icon(Icons.settings_rounded, size: 22),
+            onPressed: () async {
+              await Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => SettingsScreen(
+                    includeWeekends: _includeWeekends,
+                    fixedHolidays: _fixedHolidays,
+                    milestones: _milestones,
+                    holidayAdjustDirection: _holidayAdjustDirection,
+                    onChanged: (newInclude, newFixed, newDirection) {
+                      setState(() {
+                        _includeWeekends = newInclude;
+                        _fixedHolidays = newFixed;
+                        _holidayAdjustDirection = newDirection;
+                      });
+                      _saveData();
+                    },
+                    resolveRecurringOccurrence: (y, m, d) =>
+                        _adjustToBusinessDay(
+                          _recurringDateForMonth(y, m, d),
+                        ),
+                  ),
+                ),
+              );
+              setState(() {});
+              // 設定画面で「最終営業日に通知する」等が変更された可能性があるため
+              // 戻ってきたタイミングで必ず再計算・再予約する
+              _scheduleLastBusinessDayNotification();
+              _rescheduleRecurringMilestoneNotifications();
+            },
           ),
         ],
       ),
@@ -1853,10 +1855,13 @@ class _CalendarScreenState extends State<CalendarScreen>
 
   int _currentPageIndex = 0;
   Widget _buildTopCards(int count, DateTime lastBD) {
+    // iPhone など縦が狭い端末ではカード高さを抑えてカレンダー枠を確保
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final cardHeight = screenHeight < 750 ? 180.0 : 210.0;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20),
       child: SizedBox(
-        height: 220,
+        height: cardHeight,
         child: PageView(
           controller: _pageController,
           onPageChanged: (index) => setState(() => _currentPageIndex = index),
@@ -2065,119 +2070,148 @@ class _CalendarScreenState extends State<CalendarScreen>
     }
 
     return Container(
-      margin: const EdgeInsets.only(top: 10),
+      margin: const EdgeInsets.only(top: 8),
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: const BorderRadius.vertical(top: Radius.circular(32)),
       ),
-      child: TableCalendar(
-        // 2026年固定から、現在のシステム日付に合わせた動的レンジにUX改善
-        calendarFormat: _calendarFormat, // 現在のフォーマットを適用
-        // 月表示のみを許可し、縦スワイプによる2週間表示への切り替えを無効化
-        availableCalendarFormats: const {CalendarFormat.month: '月'},
-        onFormatChanged: (format) {
-          setState(() {
-            _calendarFormat = format; // 手動でスワイプ等された場合も状態を同期
-          });
-        },
-        firstDay: DateTime(DateTime.now().year - 1, 1, 1),
-        lastDay: DateTime(DateTime.now().year + 5, 12, 31),
-        rowHeight: 45,
-        headerStyle: const HeaderStyle(
-          formatButtonVisible: false,
-          titleCentered: true,
-        ),
-        focusedDay: _focusedDay,
-        currentDay: _today,
-        headerVisible: false,
-        onPageChanged: (focusedDay) => setState(() => _focusedDay = focusedDay),
-        selectedDayPredicate: (day) => isSameDay(day, activeCardDate ?? lastBD),
-        onDaySelected: (selectedDay, focusedDay) =>
-            _showDetailModal(context, selectedDay),
-        calendarBuilders: CalendarBuilders(
-          prioritizedBuilder: (context, day, focusedDay) {
-            if (day.month != focusedDay.month) return const SizedBox.shrink();
-            final dateKey = DateTime(day.year, day.month, day.day);
-            final config = _holidayConfigs[dateKey];
-            final bool isSelected = isSameDay(day, activeCardDate ?? lastBD);
-            final bool isToday = isSameDay(day, _today);
+      // 6行月でも親の高さに収まるよう行高さを動的計算する
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          const double daysOfWeekHeight = 18;
+          const int maxWeeks = 6;
+          final double available = constraints.maxHeight.isFinite
+              ? constraints.maxHeight
+              : 280;
+          // 端数・内側余白で overflow しないよう 2px 余裕を見る
+          final double rowHeight =
+              ((available - daysOfWeekHeight - 2) / maxWeeks).clamp(28.0, 44.0);
+          final double cellSize = (rowHeight - 4).clamp(24.0, 38.0);
 
-            BoxDecoration? cellDecoration;
-            TextStyle textStyle = TextStyle(
-              color: Theme.of(context).textTheme.bodyLarge?.color,
-              fontSize: 14,
-            );
+          return TableCalendar(
+            calendarFormat: _calendarFormat,
+            availableCalendarFormats: const {CalendarFormat.month: '月'},
+            onFormatChanged: (format) {
+              setState(() {
+                _calendarFormat = format;
+              });
+            },
+            firstDay: DateTime(DateTime.now().year - 1, 1, 1),
+            lastDay: DateTime(DateTime.now().year + 5, 12, 31),
+            rowHeight: rowHeight,
+            daysOfWeekHeight: daysOfWeekHeight,
+            headerStyle: const HeaderStyle(
+              formatButtonVisible: false,
+              titleCentered: true,
+            ),
+            focusedDay: _focusedDay,
+            currentDay: _today,
+            headerVisible: false,
+            onPageChanged: (focusedDay) =>
+                setState(() => _focusedDay = focusedDay),
+            selectedDayPredicate: (day) =>
+                isSameDay(day, activeCardDate ?? lastBD),
+            onDaySelected: (selectedDay, focusedDay) =>
+                _showDetailModal(context, selectedDay),
+            calendarBuilders: CalendarBuilders(
+              prioritizedBuilder: (context, day, focusedDay) {
+                if (day.month != focusedDay.month) {
+                  return const SizedBox.shrink();
+                }
+                final dateKey = DateTime(day.year, day.month, day.day);
+                final config = _holidayConfigs[dateKey];
+                final bool isSelected =
+                    isSameDay(day, activeCardDate ?? lastBD);
+                final bool isToday = isSameDay(day, _today);
 
-            if (isSelected) {
-              cellDecoration = BoxDecoration(
-                color: activeCardDate != null ? activeColor : Colors.blueAccent,
-                shape: BoxShape.circle,
-              );
-              textStyle = const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (isToday) {
-              cellDecoration = BoxDecoration(
-                color: Colors.blue.withOpacity(isDark ? 0.3 : 0.1),
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.blueAccent),
-              );
-              textStyle = const TextStyle(
-                color: Colors.blueAccent,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (_isRedLetterHoliday(day)) {
-              textStyle = TextStyle(
-                color: isDark ? Colors.redAccent[100] : Colors.redAccent,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (day.weekday == DateTime.saturday) {
-              textStyle = TextStyle(
-                color: isDark ? Colors.lightBlueAccent : Colors.blueAccent,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (day.weekday == DateTime.sunday || _isOffDay(day)) {
-              textStyle = TextStyle(
-                color: isDark ? Colors.redAccent[100] : Colors.redAccent,
-              );
-            }
+                BoxDecoration? cellDecoration;
+                TextStyle textStyle = TextStyle(
+                  color: Theme.of(context).textTheme.bodyLarge?.color,
+                  fontSize: cellSize < 32 ? 12 : 14,
+                );
 
-            final bool hasEvent = config != null && config.tasks.isNotEmpty;
-            final Color markerColor = (config?.isHoliday ?? false)
-                ? Colors.redAccent
-                : Theme.of(context).colorScheme.primary;
+                if (isSelected) {
+                  cellDecoration = BoxDecoration(
+                    color: activeCardDate != null
+                        ? activeColor
+                        : Colors.blueAccent,
+                    shape: BoxShape.circle,
+                  );
+                  textStyle = TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: cellSize < 32 ? 12 : 14,
+                  );
+                } else if (isToday) {
+                  cellDecoration = BoxDecoration(
+                    color: Colors.blue.withOpacity(isDark ? 0.3 : 0.1),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.blueAccent),
+                  );
+                  textStyle = TextStyle(
+                    color: Colors.blueAccent,
+                    fontWeight: FontWeight.bold,
+                    fontSize: cellSize < 32 ? 12 : 14,
+                  );
+                } else if (_isRedLetterHoliday(day)) {
+                  textStyle = TextStyle(
+                    color: isDark ? Colors.redAccent[100] : Colors.redAccent,
+                    fontWeight: FontWeight.bold,
+                    fontSize: cellSize < 32 ? 12 : 14,
+                  );
+                } else if (day.weekday == DateTime.saturday) {
+                  textStyle = TextStyle(
+                    color: isDark
+                        ? Colors.lightBlueAccent
+                        : Colors.blueAccent,
+                    fontWeight: FontWeight.bold,
+                    fontSize: cellSize < 32 ? 12 : 14,
+                  );
+                } else if (day.weekday == DateTime.sunday || _isOffDay(day)) {
+                  textStyle = TextStyle(
+                    color: isDark ? Colors.redAccent[100] : Colors.redAccent,
+                    fontSize: cellSize < 32 ? 12 : 14,
+                  );
+                }
 
-            return SizedBox(
-              width: 38,
-              height: 38,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  if (cellDecoration != null)
-                    Container(
-                      width: 34,
-                      height: 34,
-                      decoration: cellDecoration,
-                    ),
-                  Text('${day.day}', style: textStyle),
-                  if (hasEvent)
-                    Positioned(
-                      bottom: 2,
-                      child: Container(
-                        width: 6,
-                        height: 6,
-                        decoration: BoxDecoration(
-                          color: isSelected ? Colors.white : markerColor,
-                          shape: BoxShape.circle,
+                final bool hasEvent =
+                    config != null && config.tasks.isNotEmpty;
+                final Color markerColor = (config?.isHoliday ?? false)
+                    ? Colors.redAccent
+                    : Theme.of(context).colorScheme.primary;
+
+                return SizedBox(
+                  width: cellSize,
+                  height: cellSize,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      if (cellDecoration != null)
+                        Container(
+                          width: cellSize - 4,
+                          height: cellSize - 4,
+                          decoration: cellDecoration,
                         ),
-                      ),
-                    ),
-                ],
-              ),
-            );
-          },
-        ),
+                      Text('${day.day}', style: textStyle),
+                      if (hasEvent)
+                        Positioned(
+                          bottom: 1,
+                          child: Container(
+                            width: 5,
+                            height: 5,
+                            decoration: BoxDecoration(
+                              color: isSelected ? Colors.white : markerColor,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          );
+        },
       ),
     );
   }
@@ -4158,29 +4192,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   // 実機で通知が届かない時の切り分け用。
-  // 「通知の許可」と「正確なアラームの許可」は requestXxxPermission() を
-  // 呼んでも、実機側でユーザーが手動でONにしないと有効にならないことがあるため、
-  // 現在の許可状態をその場で確認できるようにする。
+  // 許可リクエストを呼んでも、端末設定でユーザーがONにしないと有効にならない
+  // ことがあるため、現在の許可状態をその場で確認できるようにする。
   Future<void> _checkNotificationPermissions() async {
     final androidImplementation = flutterLocalNotificationsPlugin
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    if (androidImplementation == null) return;
+    final iosImplementation = flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >();
+    if (androidImplementation == null && iosImplementation == null) return;
 
     bool? notificationsEnabled;
     bool? exactAlarmsEnabled;
-    try {
-      notificationsEnabled = await androidImplementation
-          .areNotificationsEnabled();
-    } catch (e) {
-      debugPrint('areNotificationsEnabled 取得失敗: $e');
-    }
-    try {
-      exactAlarmsEnabled = await androidImplementation
-          .canScheduleExactNotifications();
-    } catch (e) {
-      debugPrint('canScheduleExactNotifications 取得失敗: $e');
+    if (androidImplementation != null) {
+      try {
+        notificationsEnabled = await androidImplementation
+            .areNotificationsEnabled();
+      } catch (e) {
+        debugPrint('areNotificationsEnabled 取得失敗: $e');
+      }
+      try {
+        exactAlarmsEnabled = await androidImplementation
+            .canScheduleExactNotifications();
+      } catch (e) {
+        debugPrint('canScheduleExactNotifications 取得失敗: $e');
+      }
+    } else if (iosImplementation != null) {
+      try {
+        final options = await iosImplementation.checkPermissions();
+        notificationsEnabled = options?.isEnabled ?? false;
+      } catch (e) {
+        debugPrint('iOS checkPermissions 取得失敗: $e');
+      }
     }
 
     if (!mounted) return;
@@ -4194,13 +4240,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _permissionStatusRow('通知の許可', notificationsEnabled),
-            const SizedBox(height: 8),
-            _permissionStatusRow('正確なアラームの許可', exactAlarmsEnabled),
+            if (androidImplementation != null) ...[
+              const SizedBox(height: 8),
+              _permissionStatusRow('正確なアラームの許可', exactAlarmsEnabled),
+            ],
             const SizedBox(height: 16),
-            const Text(
-              'いずれかが「未許可」の場合は、端末の設定アプリからこのアプリの'
-              '通知・アラームとリマインダーを手動でONにしてください。',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+            Text(
+              androidImplementation != null
+                  ? 'いずれかが「未許可」の場合は、端末の設定アプリからこのアプリの'
+                        '通知・アラームとリマインダーを手動でONにしてください。'
+                  : '「未許可」の場合は、端末の設定アプリからこのアプリの'
+                        '通知を手動でONにしてください。',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
         ),
@@ -4212,13 +4263,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
           FilledButton(
             onPressed: () async {
               Navigator.pop(context);
-              // 通知が未許可なら再度リクエストダイアログを出す
-              if (notificationsEnabled != true) {
-                await androidImplementation.requestNotificationsPermission();
-              }
-              // 正確なアラームが未許可ならOS設定画面を開く
-              if (exactAlarmsEnabled != true) {
-                await androidImplementation.requestExactAlarmsPermission();
+              if (androidImplementation != null) {
+                if (notificationsEnabled != true) {
+                  await androidImplementation.requestNotificationsPermission();
+                }
+                if (exactAlarmsEnabled != true) {
+                  await androidImplementation.requestExactAlarmsPermission();
+                }
+              } else if (iosImplementation != null) {
+                if (notificationsEnabled != true) {
+                  await iosImplementation.requestPermissions(
+                    alert: true,
+                    badge: true,
+                    sound: true,
+                  );
+                } else {
+                  // iOS は設定アプリの当該アプリ画面へ誘導する
+                  await launchUrl(Uri.parse('app-settings:'));
+                }
               }
             },
             child: const Text('設定を開く'),
