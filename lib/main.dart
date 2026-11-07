@@ -10,6 +10,7 @@ import 'holiday_service.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:in_app_review/in_app_review.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'tutorial_overlay.dart';
 import 'update_checker.dart';
 import 'widget_sync.dart';
@@ -49,6 +50,19 @@ Future<void> main() async {
   if (androidImplementation != null) {
     await androidImplementation.requestNotificationsPermission();
     await androidImplementation.requestExactAlarmsPermission();
+  }
+
+  final IOSFlutterLocalNotificationsPlugin? iosImplementation =
+      flutterLocalNotificationsPlugin
+          .resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin
+          >();
+  if (iosImplementation != null) {
+    await iosImplementation.requestPermissions(
+      alert: true,
+      badge: true,
+      sound: true,
+    );
   }
 
   final prefs = await SharedPreferences.getInstance();
@@ -128,6 +142,16 @@ class TaskItem {
     this.endMinute = 0,
   });
 
+  /// 一覧・詳細でタイトル横に出す短い時刻表示
+  String get timeLabel {
+    if (isAllDay) return '終日';
+    final sh = startHour.toString().padLeft(2, '0');
+    final sm = startMinute.toString().padLeft(2, '0');
+    final eh = endHour.toString().padLeft(2, '0');
+    final em = endMinute.toString().padLeft(2, '0');
+    return '$sh:$sm-$eh:$em';
+  }
+
   Map<String, dynamic> toJson() => {
     'text': text,
     'done': done,
@@ -151,14 +175,21 @@ class TaskItem {
 
 class HolidayData {
   bool isHoliday;
+  /// 祝日・定休曜日でも、この日だけ営業日として数える
+  bool isForceWorkday;
   List<TaskItem> tasks;
   String memo;
 
-  HolidayData({this.isHoliday = false, List<TaskItem>? tasks, this.memo = ''})
-    : tasks = tasks ?? [];
+  HolidayData({
+    this.isHoliday = false,
+    this.isForceWorkday = false,
+    List<TaskItem>? tasks,
+    this.memo = '',
+  }) : tasks = tasks ?? [];
 
   Map<String, dynamic> toJson() => {
     'isHoliday': isHoliday,
+    'isForceWorkday': isForceWorkday,
     'tasks': tasks.map((t) => t.toJson()).toList(),
     'memo': memo,
   };
@@ -170,6 +201,7 @@ class HolidayData {
     }
     return HolidayData(
       isHoliday: json['isHoliday'] ?? false,
+      isForceWorkday: json['isForceWorkday'] ?? false,
       tasks: tasks,
       memo: json['memo'] ?? '',
     );
@@ -213,7 +245,14 @@ class _CalendarScreenState extends State<CalendarScreen>
 
   List<Map<String, dynamic>> _milestones = [];
   bool _overdueBannerDismissed = false;
-  bool _includeWeekends = false;
+  /// 営業日として数える曜日（DateTime.weekday: 月=1 … 日=7）
+  Set<int> _workWeekdays = {
+    DateTime.monday,
+    DateTime.tuesday,
+    DateTime.wednesday,
+    DateTime.thursday,
+    DateTime.friday,
+  };
   Map<DateTime, HolidayData> _holidayConfigs = {};
   List<FixedHoliday> _fixedHolidays = [];
   HolidayAdjustDirection _holidayAdjustDirection =
@@ -398,7 +437,17 @@ class _CalendarScreenState extends State<CalendarScreen>
           dataToSave[key.toIso8601String()] = jsonEncode(value.toJson()),
     );
     await prefs.setString('holiday_configs', jsonEncode(dataToSave));
-    await prefs.setBool('include_weekends', _includeWeekends);
+    final sortedWeekdays = _workWeekdays.toList()..sort();
+    await prefs.setStringList(
+      'work_weekdays',
+      sortedWeekdays.map((e) => e.toString()).toList(),
+    );
+    // 旧バックアップ互換: 土日の両方が営業日なら true
+    await prefs.setBool(
+      'include_weekends',
+      _workWeekdays.contains(DateTime.saturday) &&
+          _workWeekdays.contains(DateTime.sunday),
+    );
     await prefs.setInt(
       'holiday_adjust_direction',
       _holidayAdjustDirection.index,
@@ -457,7 +506,42 @@ class _CalendarScreenState extends State<CalendarScreen>
   Future<void> _loadData() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _includeWeekends = prefs.getBool('include_weekends') ?? false;
+      final savedWeekdays = prefs.getStringList('work_weekdays');
+      if (savedWeekdays != null && savedWeekdays.isNotEmpty) {
+        _workWeekdays = savedWeekdays
+            .map(int.parse)
+            .where((d) => d >= DateTime.monday && d <= DateTime.sunday)
+            .toSet();
+        if (_workWeekdays.isEmpty) {
+          _workWeekdays = {
+            DateTime.monday,
+            DateTime.tuesday,
+            DateTime.wednesday,
+            DateTime.thursday,
+            DateTime.friday,
+          };
+        }
+      } else {
+        // 旧設定「土日を営業日に含める」からの移行
+        final includeWeekends = prefs.getBool('include_weekends') ?? false;
+        _workWeekdays = includeWeekends
+            ? {
+                DateTime.monday,
+                DateTime.tuesday,
+                DateTime.wednesday,
+                DateTime.thursday,
+                DateTime.friday,
+                DateTime.saturday,
+                DateTime.sunday,
+              }
+            : {
+                DateTime.monday,
+                DateTime.tuesday,
+                DateTime.wednesday,
+                DateTime.thursday,
+                DateTime.friday,
+              };
+      }
       final savedDirectionIndex = prefs.getInt('holiday_adjust_direction');
       if (savedDirectionIndex != null &&
           savedDirectionIndex < HolidayAdjustDirection.values.length) {
@@ -533,20 +617,17 @@ class _CalendarScreenState extends State<CalendarScreen>
 
   bool _isOffDay(DateTime day) {
     final date = DateTime(day.year, day.month, day.day);
+    final config = _holidayConfigs[date];
+    // 個別の「出勤」指定は祝日・定休より優先する
+    if (config != null && config.isForceWorkday) return false;
     if (_japaneseHolidays.containsKey(_dateKeyString(date))) return true;
     if (_fixedHolidays.any(
       (fh) => fh.month == date.month && fh.day == date.day,
     )) {
       return true;
     }
-    final config = _holidayConfigs[date];
     if (config != null && config.isHoliday == true) return true;
-    if (!_includeWeekends) {
-      if (date.weekday == DateTime.saturday ||
-          date.weekday == DateTime.sunday) {
-        return true;
-      }
-    }
+    if (!_workWeekdays.contains(date.weekday)) return true;
     return false;
   }
 
@@ -564,12 +645,36 @@ class _CalendarScreenState extends State<CalendarScreen>
     }).toList();
   }
 
-  bool _isRedLetterHoliday(DateTime day) {
+  /// カレンダー日付の文字色。
+  /// 優先: 出勤=白 → 土曜=青 → 日曜・祝日=赤 → 設定の休日=赤 → 営業日=白
+  Color _calendarDayTextColor(DateTime day, {required bool isDark}) {
     final date = DateTime(day.year, day.month, day.day);
-    if (_japaneseHolidays.containsKey(_dateKeyString(date))) return true;
-    return _fixedHolidays.any(
-      (fh) => fh.month == date.month && fh.day == date.day,
-    );
+    final config = _holidayConfigs[date];
+    final Color blue = isDark ? Colors.lightBlueAccent : Colors.blueAccent;
+    final Color red = isDark
+        ? (Colors.redAccent[100] ?? Colors.redAccent)
+        : Colors.redAccent;
+    const Color workday = Colors.white;
+
+    // 詳細で「出勤」にした日は、土日祝より優先して営業日色（白）
+    if (config?.isForceWorkday == true) return workday;
+
+    if (day.weekday == DateTime.saturday) return blue;
+
+    if (day.weekday == DateTime.sunday ||
+        _japaneseHolidays.containsKey(_dateKeyString(date))) {
+      return red;
+    }
+
+    final bool isSettingsHoliday =
+        !_workWeekdays.contains(date.weekday) ||
+        (config?.isHoliday == true) ||
+        _fixedHolidays.any(
+          (fh) => fh.month == date.month && fh.day == date.day,
+        );
+    if (isSettingsHoliday) return red;
+
+    return workday;
   }
 
   Future<void> _scheduleNotification(
@@ -822,7 +927,7 @@ class _CalendarScreenState extends State<CalendarScreen>
                           Padding(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 20,
-                              vertical: 8,
+                              vertical: 4,
                             ),
                             child: Row(
                               children: [
@@ -848,7 +953,7 @@ class _CalendarScreenState extends State<CalendarScreen>
                             flex: 2,
                             child: KeyedSubtree(
                               key: _tutorialListKey,
-                              child: _buildBusinessDayList(businessDays),
+                              child: _buildScheduleList(businessDays),
                             ),
                           ),
                         ],
@@ -927,30 +1032,50 @@ class _CalendarScreenState extends State<CalendarScreen>
     );
   }
 
-  Widget _buildBusinessDayList(List<DateTime> businessDays) {
-    if (businessDays.isEmpty) return const Center(child: Text('営業日はありません'));
+  /// 予定一覧用の日付リスト（表示月・フィルタに応じて営業日以外も含む）
+  List<DateTime> _daysForScheduleList(int year, int month) {
+    final lastDay = DateTime(year, month + 1, 0).day;
+    final allDays = List.generate(
+      lastDay,
+      (i) => DateTime(year, month, i + 1),
+    );
+
+    switch (_dayFilter) {
+      case DayFilter.all:
+        // 営業日・休日を問わず、その月の全日
+        return allDays;
+      case DayFilter.withEvent:
+        // 予定が入っている日だけ（営業日・休日どちらも含む）
+        return allDays.where((day) {
+          final config = _holidayConfigs[day];
+          return config != null && config.tasks.isNotEmpty;
+        }).toList();
+      case DayFilter.holiday:
+        // 休日かつ予定がある日だけ
+        return allDays.where((day) {
+          if (!_isOffDay(day)) return false;
+          final config = _holidayConfigs[day];
+          return config != null && config.tasks.isNotEmpty;
+        }).toList();
+    }
+  }
+
+  Widget _buildScheduleList(List<DateTime> businessDays) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final todayDate = DateTime(_today.year, _today.month, _today.day);
+    final filteredDays = _daysForScheduleList(
+      _focusedDay.year,
+      _focusedDay.month,
+    );
 
-    List<MapEntry<int, DateTime>> indexedDays = businessDays
-        .asMap()
-        .entries
-        .toList();
-    List<MapEntry<int, DateTime>> filteredDays = indexedDays.where((e) {
-      final dateKey = DateTime(e.value.year, e.value.month, e.value.day);
-      final config = _holidayConfigs[dateKey];
-      switch (_dayFilter) {
-        case DayFilter.withEvent:
-          return config != null && config.tasks.isNotEmpty;
-        case DayFilter.holiday:
-          return config != null && config.isHoliday;
-        case DayFilter.all:
-          return true;
-      }
-    }).toList();
+    // 営業日番号表示用（休日は「休日」と出す）
+    final businessDayIndexByKey = <String, int>{
+      for (var i = 0; i < businessDays.length; i++)
+        _dateKeyString(businessDays[i]): i + 1,
+    };
 
-    int todayIndex = filteredDays.indexWhere((e) {
-      final dayDate = DateTime(e.value.year, e.value.month, e.value.day);
+    int todayIndex = filteredDays.indexWhere((day) {
+      final dayDate = DateTime(day.year, day.month, day.day);
       return dayDate.isAtSameMomentAs(todayDate) || dayDate.isAfter(todayDate);
     });
     if (todayIndex == -1) todayIndex = 0;
@@ -1003,12 +1128,15 @@ class _CalendarScreenState extends State<CalendarScreen>
                   ),
                   itemCount: filteredDays.length,
                   itemBuilder: (context, listIndex) {
-                    final entry = filteredDays[listIndex];
-                    final int index = entry.key;
-                    DateTime day = entry.value;
+                    final DateTime day = filteredDays[listIndex];
                     bool isToday = isSameDay(day, _today);
                     final dateKey = DateTime(day.year, day.month, day.day);
                     final config = _holidayConfigs[dateKey];
+                    final businessDayNumber =
+                        businessDayIndexByKey[_dateKeyString(dateKey)];
+                    final dayKindLabel = businessDayNumber != null
+                        ? '第$businessDayNumber営業日'
+                        : '休日';
 
                     return Dismissible(
                       key: ValueKey(
@@ -1093,9 +1221,11 @@ class _CalendarScreenState extends State<CalendarScreen>
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text(
-                                      '第${index + 1}営業日',
+                                      dayKindLabel,
                                       style: TextStyle(
-                                        color: Colors.blueGrey[300],
+                                        color: businessDayNumber != null
+                                            ? Colors.blueGrey[300]
+                                            : Colors.redAccent[200],
                                         fontSize: 10,
                                       ),
                                     ),
@@ -1161,6 +1291,17 @@ class _CalendarScreenState extends State<CalendarScreen>
                                                       : Colors.blueGrey,
                                                 ),
                                                 const SizedBox(width: 4),
+                                                Text(
+                                                  t.timeLabel,
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: t.done
+                                                        ? Colors.grey
+                                                        : Colors.blueGrey[600],
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 6),
                                                 Flexible(
                                                   child: Text(
                                                     t.text,
@@ -1261,144 +1402,134 @@ class _CalendarScreenState extends State<CalendarScreen>
     );
   }
 
+  ButtonStyle get _headerIconStyle => IconButton.styleFrom(
+    padding: const EdgeInsets.all(6),
+    minimumSize: const Size(36, 36),
+    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    visualDensity: VisualDensity.compact,
+  );
+
   Widget _buildHeader() {
     return Padding(
-      // 左右の余白を 20 から 12 に少し狭めてスペースを確保
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        // 年月・矢印・アクションを横いっぱいに等間隔配置
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
-          // 左側：年月切り替え部分を Expanded で囲み、はみ出しを防止
-          Expanded(
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.chevron_left),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                  onPressed: () => setState(
-                    () => _focusedDay = DateTime(
-                      _focusedDay.year,
-                      _focusedDay.month - 1,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 4),
-                // 万が一画面幅が狭くても文字が潰れないようFlexibleで保護
-                Flexible(
-                  child: Text(
-                    '${_focusedDay.year}/${_focusedDay.month}',
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.blueGrey,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                  ),
-                ),
-                const SizedBox(width: 4),
-                IconButton(
-                  icon: const Icon(Icons.chevron_right),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                  onPressed: () => setState(
-                    () => _focusedDay = DateTime(
-                      _focusedDay.year,
-                      _focusedDay.month + 1,
-                    ),
-                  ),
-                ),
-              ],
+          IconButton(
+            style: _headerIconStyle,
+            icon: const Icon(Icons.chevron_left, size: 28),
+            onPressed: () => setState(
+              () => _focusedDay = DateTime(
+                _focusedDay.year,
+                _focusedDay.month - 1,
+              ),
             ),
           ),
-          const SizedBox(width: 8),
-          // 右側：アクションボタン（ここは元のサイズを維持）
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              IconButton(
-                key: _tutorialSearchKey,
-                icon: const Icon(Icons.search_rounded, size: 24),
-                tooltip: '検索',
-                onPressed: () async {
-                  final DateTime? jumpTo = await Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => SearchScreen(
-                        holidayConfigs: _holidayConfigs,
-                        milestones: _milestones,
-                      ),
-                    ),
-                  );
-                  if (jumpTo != null) {
-                    setState(() {
-                      _focusedDay = DateTime(jumpTo.year, jumpTo.month);
-                      _needsScrollToToday = true;
-                    });
-                  }
-                },
+          Text(
+            '${_focusedDay.year}/${_focusedDay.month}',
+            style: const TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+              color: Colors.blueGrey,
+              height: 1.1,
+            ),
+            maxLines: 1,
+          ),
+          IconButton(
+            style: _headerIconStyle,
+            icon: const Icon(Icons.chevron_right, size: 28),
+            onPressed: () => setState(
+              () => _focusedDay = DateTime(
+                _focusedDay.year,
+                _focusedDay.month + 1,
               ),
-              IconButton(
-                key: _tutorialTodayKey,
-                icon: const Icon(Icons.today_rounded, size: 22),
-                tooltip: '今日に戻る',
-                onPressed: () => setState(() {
-                  _focusedDay = DateTime.now();
-                  _needsScrollToToday = true;
-                }),
-              ),
-              IconButton(
-                key: _tutorialViewToggleKey,
-                icon: Icon(
-                  _isTimelineMode
-                      ? Icons
-                            .calendar_month_rounded // タイムライン中は「カレンダーアイコン」
-                      : Icons.format_list_bulleted_rounded, // カレンダー中は「リストアイコン」
-                  size: 24,
+            ),
+          ),
+          IconButton(
+            key: _tutorialSearchKey,
+            style: _headerIconStyle,
+            icon: const Icon(Icons.search_rounded, size: 22),
+            tooltip: '検索',
+            onPressed: () async {
+              final DateTime? jumpTo = await Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => SearchScreen(
+                    holidayConfigs: _holidayConfigs,
+                    milestones: _milestones,
+                  ),
                 ),
-                tooltip: _isTimelineMode ? 'カレンダー表示' : 'タイムライン表示',
-                onPressed: () {
-                  setState(() {
-                    _isTimelineMode = !_isTimelineMode;
-                  });
-                },
-              ),
-              IconButton(
-                icon: const Icon(Icons.settings_rounded, size: 26),
-                onPressed: () async {
-                  await Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => SettingsScreen(
-                        includeWeekends: _includeWeekends,
-                        fixedHolidays: _fixedHolidays,
-                        milestones: _milestones,
-                        holidayAdjustDirection: _holidayAdjustDirection,
-                        onChanged: (newInclude, newFixed, newDirection) {
-                          setState(() {
-                            _includeWeekends = newInclude;
-                            _fixedHolidays = newFixed;
-                            _holidayAdjustDirection = newDirection;
-                          });
-                          _saveData();
-                        },
-                        resolveRecurringOccurrence: (y, m, d) =>
-                            _adjustToBusinessDay(
-                              _recurringDateForMonth(y, m, d),
-                            ),
-                      ),
-                    ),
-                  );
-                  setState(() {});
-                  // 設定画面で「最終営業日に通知する」等が変更された可能性があるため
-                  // 戻ってきたタイミングで必ず再計算・再予約する
-                  _scheduleLastBusinessDayNotification();
-                  _rescheduleRecurringMilestoneNotifications();
-                },
-              ),
-            ],
+              );
+              if (jumpTo != null) {
+                setState(() {
+                  _focusedDay = DateTime(jumpTo.year, jumpTo.month);
+                  _needsScrollToToday = true;
+                });
+              }
+            },
+          ),
+          IconButton(
+            key: _tutorialTodayKey,
+            style: _headerIconStyle,
+            icon: const Icon(Icons.today_rounded, size: 20),
+            tooltip: '今日に戻る',
+            onPressed: () => setState(() {
+              _focusedDay = DateTime.now();
+              _needsScrollToToday = true;
+            }),
+          ),
+          IconButton(
+            key: _tutorialViewToggleKey,
+            style: _headerIconStyle,
+            icon: Icon(
+              _isTimelineMode
+                  ? Icons.calendar_month_rounded
+                  : Icons.format_list_bulleted_rounded,
+              size: 22,
+            ),
+            tooltip: _isTimelineMode ? 'カレンダー表示' : 'タイムライン表示',
+            onPressed: () {
+              setState(() {
+                _isTimelineMode = !_isTimelineMode;
+              });
+            },
+          ),
+          IconButton(
+            style: _headerIconStyle,
+            icon: const Icon(Icons.settings_rounded, size: 22),
+            onPressed: () async {
+              await Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => SettingsScreen(
+                    workWeekdays: _workWeekdays,
+                    fixedHolidays: _fixedHolidays,
+                    milestones: _milestones,
+                    holidayAdjustDirection: _holidayAdjustDirection,
+                    onChanged: (newWeekdays, newFixed, newDirection) {
+                      setState(() {
+                        _workWeekdays = Set<int>.from(newWeekdays);
+                        _fixedHolidays = newFixed;
+                        _holidayAdjustDirection = newDirection;
+                      });
+                      _saveData();
+                    },
+                    resolveRecurringOccurrence: (y, m, d) =>
+                        _adjustToBusinessDay(
+                          _recurringDateForMonth(y, m, d),
+                        ),
+                    onNotifyScheduleChanged:
+                        _scheduleLastBusinessDayNotification,
+                  ),
+                ),
+              );
+              setState(() {});
+              // 設定画面で「最終営業日に通知する」等が変更された可能性があるため
+              // 戻ってきたタイミングで必ず再計算・再予約する
+              _scheduleLastBusinessDayNotification();
+              _rescheduleRecurringMilestoneNotifications();
+            },
           ),
         ],
       ),
@@ -1853,10 +1984,13 @@ class _CalendarScreenState extends State<CalendarScreen>
 
   int _currentPageIndex = 0;
   Widget _buildTopCards(int count, DateTime lastBD) {
+    // iPhone など縦が狭い端末ではカード高さを抑えてカレンダー枠を確保
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final cardHeight = screenHeight < 750 ? 180.0 : 210.0;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20),
       child: SizedBox(
-        height: 220,
+        height: cardHeight,
         child: PageView(
           controller: _pageController,
           onPageChanged: (index) => setState(() => _currentPageIndex = index),
@@ -2065,119 +2199,143 @@ class _CalendarScreenState extends State<CalendarScreen>
     }
 
     return Container(
-      margin: const EdgeInsets.only(top: 10),
+      margin: const EdgeInsets.only(top: 8),
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: const BorderRadius.vertical(top: Radius.circular(32)),
       ),
-      child: TableCalendar(
-        // 2026年固定から、現在のシステム日付に合わせた動的レンジにUX改善
-        calendarFormat: _calendarFormat, // 現在のフォーマットを適用
-        // 月表示のみを許可し、縦スワイプによる2週間表示への切り替えを無効化
-        availableCalendarFormats: const {CalendarFormat.month: '月'},
-        onFormatChanged: (format) {
-          setState(() {
-            _calendarFormat = format; // 手動でスワイプ等された場合も状態を同期
-          });
-        },
-        firstDay: DateTime(DateTime.now().year - 1, 1, 1),
-        lastDay: DateTime(DateTime.now().year + 5, 12, 31),
-        rowHeight: 45,
-        headerStyle: const HeaderStyle(
-          formatButtonVisible: false,
-          titleCentered: true,
-        ),
-        focusedDay: _focusedDay,
-        currentDay: _today,
-        headerVisible: false,
-        onPageChanged: (focusedDay) => setState(() => _focusedDay = focusedDay),
-        selectedDayPredicate: (day) => isSameDay(day, activeCardDate ?? lastBD),
-        onDaySelected: (selectedDay, focusedDay) =>
-            _showDetailModal(context, selectedDay),
-        calendarBuilders: CalendarBuilders(
-          prioritizedBuilder: (context, day, focusedDay) {
-            if (day.month != focusedDay.month) return const SizedBox.shrink();
-            final dateKey = DateTime(day.year, day.month, day.day);
-            final config = _holidayConfigs[dateKey];
-            final bool isSelected = isSameDay(day, activeCardDate ?? lastBD);
-            final bool isToday = isSameDay(day, _today);
+      // 6行月でも親の高さに収まるよう行高さを動的計算する
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          const double daysOfWeekHeight = 18;
+          const int maxWeeks = 6;
+          final double available = constraints.maxHeight.isFinite
+              ? constraints.maxHeight
+              : 280;
+          // 端数・内側余白で overflow しないよう 2px 余裕を見る
+          final double rowHeight =
+              ((available - daysOfWeekHeight - 2) / maxWeeks).clamp(28.0, 44.0);
+          final double cellSize = (rowHeight - 4).clamp(24.0, 38.0);
 
-            BoxDecoration? cellDecoration;
-            TextStyle textStyle = TextStyle(
-              color: Theme.of(context).textTheme.bodyLarge?.color,
-              fontSize: 14,
-            );
+          return TableCalendar(
+            calendarFormat: _calendarFormat,
+            availableCalendarFormats: const {CalendarFormat.month: '月'},
+            onFormatChanged: (format) {
+              setState(() {
+                _calendarFormat = format;
+              });
+            },
+            firstDay: DateTime(DateTime.now().year - 1, 1, 1),
+            lastDay: DateTime(DateTime.now().year + 5, 12, 31),
+            rowHeight: rowHeight,
+            daysOfWeekHeight: daysOfWeekHeight,
+            headerStyle: const HeaderStyle(
+              formatButtonVisible: false,
+              titleCentered: true,
+            ),
+            focusedDay: _focusedDay,
+            currentDay: _today,
+            headerVisible: false,
+            onPageChanged: (focusedDay) =>
+                setState(() => _focusedDay = focusedDay),
+            selectedDayPredicate: (day) =>
+                isSameDay(day, activeCardDate ?? lastBD),
+            onDaySelected: (selectedDay, focusedDay) =>
+                _showDetailModal(context, selectedDay),
+            calendarBuilders: CalendarBuilders(
+              prioritizedBuilder: (context, day, focusedDay) {
+                if (day.month != focusedDay.month) {
+                  return const SizedBox.shrink();
+                }
+                final dateKey = DateTime(day.year, day.month, day.day);
+                final config = _holidayConfigs[dateKey];
+                final bool isSelected =
+                    isSameDay(day, activeCardDate ?? lastBD);
+                final bool isToday = isSameDay(day, _today);
 
-            if (isSelected) {
-              cellDecoration = BoxDecoration(
-                color: activeCardDate != null ? activeColor : Colors.blueAccent,
-                shape: BoxShape.circle,
-              );
-              textStyle = const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (isToday) {
-              cellDecoration = BoxDecoration(
-                color: Colors.blue.withOpacity(isDark ? 0.3 : 0.1),
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.blueAccent),
-              );
-              textStyle = const TextStyle(
-                color: Colors.blueAccent,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (_isRedLetterHoliday(day)) {
-              textStyle = TextStyle(
-                color: isDark ? Colors.redAccent[100] : Colors.redAccent,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (day.weekday == DateTime.saturday) {
-              textStyle = TextStyle(
-                color: isDark ? Colors.lightBlueAccent : Colors.blueAccent,
-                fontWeight: FontWeight.bold,
-              );
-            } else if (day.weekday == DateTime.sunday || _isOffDay(day)) {
-              textStyle = TextStyle(
-                color: isDark ? Colors.redAccent[100] : Colors.redAccent,
-              );
-            }
+                BoxDecoration? cellDecoration;
+                final Color dayColor = _calendarDayTextColor(
+                  day,
+                  isDark: isDark,
+                );
+                TextStyle textStyle = TextStyle(
+                  color: dayColor,
+                  fontSize: cellSize < 32 ? 12 : 14,
+                  fontWeight:
+                      day.weekday == DateTime.saturday ||
+                          day.weekday == DateTime.sunday ||
+                          _japaneseHolidays.containsKey(
+                            _dateKeyString(dateKey),
+                          )
+                      ? FontWeight.bold
+                      : FontWeight.normal,
+                );
 
-            final bool hasEvent = config != null && config.tasks.isNotEmpty;
-            final Color markerColor = (config?.isHoliday ?? false)
-                ? Colors.redAccent
-                : Theme.of(context).colorScheme.primary;
+                if (isSelected) {
+                  cellDecoration = BoxDecoration(
+                    color: activeCardDate != null
+                        ? activeColor
+                        : Colors.blueAccent,
+                    shape: BoxShape.circle,
+                  );
+                  textStyle = TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: cellSize < 32 ? 12 : 14,
+                  );
+                } else if (isToday) {
+                  cellDecoration = BoxDecoration(
+                    color: Colors.blue.withOpacity(isDark ? 0.3 : 0.1),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.blueAccent),
+                  );
+                  textStyle = TextStyle(
+                    color: Colors.blueAccent,
+                    fontWeight: FontWeight.bold,
+                    fontSize: cellSize < 32 ? 12 : 14,
+                  );
+                }
 
-            return SizedBox(
-              width: 38,
-              height: 38,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  if (cellDecoration != null)
-                    Container(
-                      width: 34,
-                      height: 34,
-                      decoration: cellDecoration,
-                    ),
-                  Text('${day.day}', style: textStyle),
-                  if (hasEvent)
-                    Positioned(
-                      bottom: 2,
-                      child: Container(
-                        width: 6,
-                        height: 6,
-                        decoration: BoxDecoration(
-                          color: isSelected ? Colors.white : markerColor,
-                          shape: BoxShape.circle,
+                final bool hasEvent =
+                    config != null && config.tasks.isNotEmpty;
+                final Color markerColor = (config?.isHoliday ?? false)
+                    ? Colors.redAccent
+                    : (config?.isForceWorkday ?? false)
+                        ? Colors.teal
+                        : Theme.of(context).colorScheme.primary;
+
+                return SizedBox(
+                  width: cellSize,
+                  height: cellSize,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      if (cellDecoration != null)
+                        Container(
+                          width: cellSize - 4,
+                          height: cellSize - 4,
+                          decoration: cellDecoration,
                         ),
-                      ),
-                    ),
-                ],
-              ),
-            );
-          },
-        ),
+                      Text('${day.day}', style: textStyle),
+                      if (hasEvent)
+                        Positioned(
+                          bottom: 1,
+                          child: Container(
+                            width: 5,
+                            height: 5,
+                            decoration: BoxDecoration(
+                              color: isSelected ? Colors.white : markerColor,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          );
+        },
       ),
     );
   }
@@ -2249,6 +2407,25 @@ class _CalendarScreenState extends State<CalendarScreen>
                           fontWeight: FontWeight.w600,
                         ),
                       ),
+                    )
+                  else if (config?.isForceWorkday == true)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.teal.withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: const Text(
+                        '出勤',
+                        style: TextStyle(
+                          color: Colors.teal,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
                     ),
                 ],
               ),
@@ -2282,6 +2459,17 @@ class _CalendarScreenState extends State<CalendarScreen>
                                   color: task.done
                                       ? Colors.green
                                       : Colors.blueGrey,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  task.timeLabel,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: task.done
+                                        ? Colors.grey
+                                        : Colors.blueGrey[600],
+                                  ),
                                 ),
                                 const SizedBox(width: 6),
                                 Expanded(
@@ -2397,18 +2585,40 @@ class _CalendarScreenState extends State<CalendarScreen>
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                Text(
+                  '${selectedDay.month}/${selectedDay.day} の詳細設定',
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'この日の扱い',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.grey,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
                   children: [
-                    Text(
-                      '${selectedDay.month}/${selectedDay.day} の詳細設定',
-                      style: const TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                      ),
+                    FilterChip(
+                      label: const Text('通常'),
+                      selected: !config.isHoliday && !config.isForceWorkday,
+                      onSelected: (_) {
+                        setModalState(() {
+                          config.isHoliday = false;
+                          config.isForceWorkday = false;
+                        });
+                        setState(() {});
+                        _saveData();
+                      },
                     ),
                     FilterChip(
-                      label: const Text('休日設定'),
+                      label: const Text('休日'),
                       selected: config.isHoliday,
                       selectedColor: Colors.redAccent.withOpacity(0.2),
                       checkmarkColor: Colors.redAccent,
@@ -2416,13 +2626,42 @@ class _CalendarScreenState extends State<CalendarScreen>
                         color: config.isHoliday ? Colors.redAccent : null,
                         fontWeight: config.isHoliday ? FontWeight.bold : null,
                       ),
-                      onSelected: (bool selected) {
-                        setModalState(() => config.isHoliday = selected);
+                      onSelected: (_) {
+                        setModalState(() {
+                          config.isHoliday = true;
+                          config.isForceWorkday = false;
+                        });
+                        setState(() {});
+                        _saveData();
+                      },
+                    ),
+                    FilterChip(
+                      label: const Text('出勤'),
+                      selected: config.isForceWorkday,
+                      selectedColor: Colors.teal.withOpacity(0.2),
+                      checkmarkColor: Colors.teal,
+                      labelStyle: TextStyle(
+                        color: config.isForceWorkday ? Colors.teal : null,
+                        fontWeight:
+                            config.isForceWorkday ? FontWeight.bold : null,
+                      ),
+                      onSelected: (_) {
+                        setModalState(() {
+                          config.isForceWorkday = true;
+                          config.isHoliday = false;
+                        });
                         setState(() {});
                         _saveData();
                       },
                     ),
                   ],
+                ),
+                const Padding(
+                  padding: EdgeInsets.only(top: 6),
+                  child: Text(
+                    '「出勤」は祝日や定休曜日でも営業日として数えます',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
                 ),
                 const SizedBox(height: 16),
 
@@ -2478,15 +2717,6 @@ class _CalendarScreenState extends State<CalendarScreen>
                     int index = entry.key;
                     var task = entry.value;
 
-                    String timeLabel = "終日";
-                    if (!task.isAllDay) {
-                      final sh = task.startHour.toString().padLeft(2, '0');
-                      final sm = task.startMinute.toString().padLeft(2, '0');
-                      final eh = task.endHour.toString().padLeft(2, '0');
-                      final em = task.endMinute.toString().padLeft(2, '0');
-                      timeLabel = "$sh:$sm - $eh:$em";
-                    }
-
                     return Card(
                       margin: const EdgeInsets.only(bottom: 6),
                       child: ListTile(
@@ -2517,7 +2747,7 @@ class _CalendarScreenState extends State<CalendarScreen>
                           ),
                         ),
                         subtitle: Text(
-                          timeLabel,
+                          task.timeLabel,
                           style: TextStyle(
                             fontSize: 12,
                             color: task.done ? Colors.grey : Colors.blue[700],
@@ -3573,24 +3803,28 @@ class _SearchScreenState extends State<SearchScreen> {
 }
 
 class SettingsScreen extends StatefulWidget {
-  final bool includeWeekends;
+  final Set<int> workWeekdays;
   final List<FixedHoliday> fixedHolidays;
   final List<Map<String, dynamic>> milestones;
   final HolidayAdjustDirection holidayAdjustDirection;
-  final Function(bool, List<FixedHoliday>, HolidayAdjustDirection) onChanged;
+  final Function(Set<int>, List<FixedHoliday>, HolidayAdjustDirection)
+  onChanged;
   // 「毎月繰り返す」予定の、指定した年月における休日調整済みの実際の対象日を
   // 求めるための関数（親画面の休日設定・調整方向を反映するため呼び出す）
   final DateTime Function(int year, int month, int day)
   resolveRecurringOccurrence;
+  // 通知時刻変更や最終営業日トグルの直後に、親側で最終営業日通知を再予約する
+  final Future<void> Function() onNotifyScheduleChanged;
 
   const SettingsScreen({
     super.key,
-    required this.includeWeekends,
+    required this.workWeekdays,
     required this.fixedHolidays,
     required this.milestones,
     required this.holidayAdjustDirection,
     required this.onChanged,
     required this.resolveRecurringOccurrence,
+    required this.onNotifyScheduleChanged,
   });
 
   @override
@@ -3598,7 +3832,18 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  late bool _tempIncludeWeekends;
+  static const List<int> _weekdayOrder = [
+    DateTime.monday,
+    DateTime.tuesday,
+    DateTime.wednesday,
+    DateTime.thursday,
+    DateTime.friday,
+    DateTime.saturday,
+    DateTime.sunday,
+  ];
+  static const List<String> _weekdayLabels = ['月', '火', '水', '木', '金', '土', '日'];
+
+  late Set<int> _tempWorkWeekdays;
   late List<FixedHoliday> _tempFixedHolidays;
   late HolidayAdjustDirection _tempHolidayAdjustDirection;
   int _notifyHour = 9;
@@ -3608,10 +3853,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
-    _tempIncludeWeekends = widget.includeWeekends;
+    _tempWorkWeekdays = Set<int>.from(widget.workWeekdays);
     _tempFixedHolidays = List.from(widget.fixedHolidays);
     _tempHolidayAdjustDirection = widget.holidayAdjustDirection;
     _loadNotifyTime();
+  }
+
+  void _notifyWorkdayChange() {
+    widget.onChanged(
+      Set<int>.from(_tempWorkWeekdays),
+      _tempFixedHolidays,
+      _tempHolidayAdjustDirection,
+    );
   }
 
   Future<void> _loadNotifyTime() async {
@@ -3751,6 +4004,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       }
                     }
 
+                    // cancelAll で最終営業日通知も消えるため、ここで新しい時刻で再予約する
+                    await widget.onNotifyScheduleChanged();
+
                     // モーダルを閉じるのは、非同期処理が全て終わった後にする
                     // (先に閉じてしまうと、以降で使う context が無効化され
                     //  SnackBar表示などが失敗する)
@@ -3838,6 +4094,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final prefs = await SharedPreferences.getInstance();
       Map<String, dynamic> exportMap = {};
       exportMap['holiday_configs'] = prefs.getString('holiday_configs') ?? '{}';
+      exportMap['work_weekdays'] =
+          prefs.getStringList('work_weekdays') ??
+          ['1', '2', '3', '4', '5'];
       exportMap['include_weekends'] =
           prefs.getBool('include_weekends') ?? false;
       exportMap['fixed_holidays_v2'] =
@@ -3847,6 +4106,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       exportMap['theme_mode'] = prefs.getInt('theme_mode') ?? 0;
       exportMap['theme_color'] =
           prefs.getInt('theme_color') ?? Colors.blueAccent.value;
+      exportMap['notify_hour'] = prefs.getInt('notify_hour') ?? 9;
+      exportMap['notify_minute'] = prefs.getInt('notify_minute') ?? 0;
+      exportMap['notify_last_business_day'] =
+          prefs.getBool('notify_last_business_day') ?? true;
 
       String jsonStr = jsonEncode(exportMap);
       await Clipboard.setData(ClipboardData(text: jsonStr));
@@ -3880,8 +4143,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (importMap.containsKey('holiday_configs')) {
         await prefs.setString('holiday_configs', importMap['holiday_configs']);
       }
-      if (importMap.containsKey('include_weekends')) {
-        await prefs.setBool('include_weekends', importMap['include_weekends']);
+      if (importMap.containsKey('work_weekdays')) {
+        final raw = importMap['work_weekdays'];
+        final List<String> weekdayList = raw is List
+            ? raw.map((e) => e.toString()).toList()
+            : <String>[];
+        if (weekdayList.isNotEmpty) {
+          await prefs.setStringList('work_weekdays', weekdayList);
+          final asInts = weekdayList
+              .map(int.parse)
+              .where((d) => d >= DateTime.monday && d <= DateTime.sunday)
+              .toSet();
+          await prefs.setBool(
+            'include_weekends',
+            asInts.contains(DateTime.saturday) &&
+                asInts.contains(DateTime.sunday),
+          );
+        }
+      } else if (importMap.containsKey('include_weekends')) {
+        // 旧バックアップ互換
+        final includeWeekends = importMap['include_weekends'] == true;
+        await prefs.setBool('include_weekends', includeWeekends);
+        await prefs.setStringList(
+          'work_weekdays',
+          includeWeekends
+              ? ['1', '2', '3', '4', '5', '6', '7']
+              : ['1', '2', '3', '4', '5'],
+        );
       }
       if (importMap.containsKey('fixed_holidays_v2')) {
         List<String> fixedList = List<String>.from(
@@ -3901,8 +4189,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (importMap.containsKey('theme_color')) {
         await prefs.setInt('theme_color', importMap['theme_color']);
       }
+      if (importMap.containsKey('notify_hour')) {
+        await prefs.setInt('notify_hour', importMap['notify_hour'] as int);
+      }
+      if (importMap.containsKey('notify_minute')) {
+        await prefs.setInt('notify_minute', importMap['notify_minute'] as int);
+      }
+      if (importMap.containsKey('notify_last_business_day')) {
+        await prefs.setBool(
+          'notify_last_business_day',
+          importMap['notify_last_business_day'] as bool,
+        );
+      }
 
       if (!mounted) return;
+      // 通知設定 UI を即座に反映（再起動前でも設定画面上は正しい値を見せる）
+      await _loadNotifyTime();
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('データを復元しました。アプリを再起動して反映してください')),
       );
@@ -3923,23 +4225,102 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              child: Text(
+                '営業曜日',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                ),
+              ),
+            ),
             Card(
-              child: Column(
-                children: [
-                  SwitchListTile(
-                    title: const Text('土日を営業日に含める'),
-                    subtitle: const Text('カレンダー上でのカウント対象になります'),
-                    value: _tempIncludeWeekends,
-                    onChanged: (val) {
-                      setState(() => _tempIncludeWeekends = val);
-                      widget.onChanged(
-                        _tempIncludeWeekends,
-                        _tempFixedHolidays,
-                        _tempHolidayAdjustDirection,
-                      );
-                    },
-                  ),
-                ],
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '営業日として数える曜日',
+                      style: TextStyle(fontSize: 16),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'オフにした曜日は定休日として扱います',
+                      style: TextStyle(fontSize: 13, color: Colors.grey),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: List.generate(_weekdayOrder.length, (i) {
+                        final weekday = _weekdayOrder[i];
+                        final selected = _tempWorkWeekdays.contains(weekday);
+                        final isWeekend =
+                            weekday == DateTime.saturday ||
+                            weekday == DateTime.sunday;
+                        return FilterChip(
+                          label: Text(_weekdayLabels[i]),
+                          selected: selected,
+                          selectedColor: isWeekend
+                              ? Colors.blueAccent.withOpacity(0.18)
+                              : null,
+                          onSelected: (val) {
+                            setState(() {
+                              if (val) {
+                                _tempWorkWeekdays.add(weekday);
+                              } else {
+                                // 全曜日オフだと営業日が0になるため、最低1つは残す
+                                if (_tempWorkWeekdays.length <= 1) return;
+                                _tempWorkWeekdays.remove(weekday);
+                              }
+                            });
+                            _notifyWorkdayChange();
+                          },
+                        );
+                      }),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        TextButton(
+                          onPressed: () {
+                            setState(() {
+                              _tempWorkWeekdays = {
+                                DateTime.monday,
+                                DateTime.tuesday,
+                                DateTime.wednesday,
+                                DateTime.thursday,
+                                DateTime.friday,
+                              };
+                            });
+                            _notifyWorkdayChange();
+                          },
+                          child: const Text('平日のみ'),
+                        ),
+                        TextButton(
+                          onPressed: () {
+                            setState(() {
+                              _tempWorkWeekdays = {
+                                DateTime.monday,
+                                DateTime.tuesday,
+                                DateTime.wednesday,
+                                DateTime.thursday,
+                                DateTime.friday,
+                                DateTime.saturday,
+                                DateTime.sunday,
+                              };
+                            });
+                            _notifyWorkdayChange();
+                          },
+                          child: const Text('毎日'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 12),
@@ -3994,11 +4375,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onChanged: (v) {
                       if (v == null) return;
                       setState(() => _tempHolidayAdjustDirection = v);
-                      widget.onChanged(
-                        _tempIncludeWeekends,
-                        _tempFixedHolidays,
-                        _tempHolidayAdjustDirection,
-                      );
+                      _notifyWorkdayChange();
                     },
                   ),
                   RadioListTile<HolidayAdjustDirection>(
@@ -4009,11 +4386,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onChanged: (v) {
                       if (v == null) return;
                       setState(() => _tempHolidayAdjustDirection = v);
-                      widget.onChanged(
-                        _tempIncludeWeekends,
-                        _tempFixedHolidays,
-                        _tempHolidayAdjustDirection,
-                      );
+                      _notifyWorkdayChange();
                     },
                   ),
                 ],
@@ -4136,6 +4509,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       setState(() => _notifyLastBusinessDay = v);
                       final prefs = await SharedPreferences.getInstance();
                       await prefs.setBool('notify_last_business_day', v);
+                      await widget.onNotifyScheduleChanged();
                     },
                   ),
                   const Divider(height: 1),
@@ -4158,29 +4532,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   // 実機で通知が届かない時の切り分け用。
-  // 「通知の許可」と「正確なアラームの許可」は requestXxxPermission() を
-  // 呼んでも、実機側でユーザーが手動でONにしないと有効にならないことがあるため、
-  // 現在の許可状態をその場で確認できるようにする。
+  // 許可リクエストを呼んでも、端末設定でユーザーがONにしないと有効にならない
+  // ことがあるため、現在の許可状態をその場で確認できるようにする。
   Future<void> _checkNotificationPermissions() async {
     final androidImplementation = flutterLocalNotificationsPlugin
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    if (androidImplementation == null) return;
+    final iosImplementation = flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >();
+    if (androidImplementation == null && iosImplementation == null) return;
 
     bool? notificationsEnabled;
     bool? exactAlarmsEnabled;
-    try {
-      notificationsEnabled = await androidImplementation
-          .areNotificationsEnabled();
-    } catch (e) {
-      debugPrint('areNotificationsEnabled 取得失敗: $e');
-    }
-    try {
-      exactAlarmsEnabled = await androidImplementation
-          .canScheduleExactNotifications();
-    } catch (e) {
-      debugPrint('canScheduleExactNotifications 取得失敗: $e');
+    if (androidImplementation != null) {
+      try {
+        notificationsEnabled = await androidImplementation
+            .areNotificationsEnabled();
+      } catch (e) {
+        debugPrint('areNotificationsEnabled 取得失敗: $e');
+      }
+      try {
+        exactAlarmsEnabled = await androidImplementation
+            .canScheduleExactNotifications();
+      } catch (e) {
+        debugPrint('canScheduleExactNotifications 取得失敗: $e');
+      }
+    } else if (iosImplementation != null) {
+      try {
+        final options = await iosImplementation.checkPermissions();
+        notificationsEnabled = options?.isEnabled ?? false;
+      } catch (e) {
+        debugPrint('iOS checkPermissions 取得失敗: $e');
+      }
     }
 
     if (!mounted) return;
@@ -4194,13 +4580,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _permissionStatusRow('通知の許可', notificationsEnabled),
-            const SizedBox(height: 8),
-            _permissionStatusRow('正確なアラームの許可', exactAlarmsEnabled),
+            if (androidImplementation != null) ...[
+              const SizedBox(height: 8),
+              _permissionStatusRow('正確なアラームの許可', exactAlarmsEnabled),
+            ],
             const SizedBox(height: 16),
-            const Text(
-              'いずれかが「未許可」の場合は、端末の設定アプリからこのアプリの'
-              '通知・アラームとリマインダーを手動でONにしてください。',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+            Text(
+              androidImplementation != null
+                  ? 'いずれかが「未許可」の場合は、端末の設定アプリからこのアプリの'
+                        '通知・アラームとリマインダーを手動でONにしてください。'
+                  : '「未許可」の場合は、端末の設定アプリからこのアプリの'
+                        '通知を手動でONにしてください。',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
         ),
@@ -4212,13 +4603,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
           FilledButton(
             onPressed: () async {
               Navigator.pop(context);
-              // 通知が未許可なら再度リクエストダイアログを出す
-              if (notificationsEnabled != true) {
-                await androidImplementation.requestNotificationsPermission();
-              }
-              // 正確なアラームが未許可ならOS設定画面を開く
-              if (exactAlarmsEnabled != true) {
-                await androidImplementation.requestExactAlarmsPermission();
+              if (androidImplementation != null) {
+                if (notificationsEnabled != true) {
+                  await androidImplementation.requestNotificationsPermission();
+                }
+                if (exactAlarmsEnabled != true) {
+                  await androidImplementation.requestExactAlarmsPermission();
+                }
+              } else if (iosImplementation != null) {
+                if (notificationsEnabled != true) {
+                  await iosImplementation.requestPermissions(
+                    alert: true,
+                    badge: true,
+                    sound: true,
+                  );
+                } else {
+                  // iOS は設定アプリの当該アプリ画面へ誘導する
+                  await launchUrl(Uri.parse('app-settings:'));
+                }
               }
             },
             child: const Text('設定を開く'),
