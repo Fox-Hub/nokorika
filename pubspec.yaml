@@ -1,7 +1,7 @@
 name: nokorika
 description: "nokorika studio作成のアプリ「ノコリカ」"
 
-version: 1.0.0+13
+version: 1.0.1+17
 
 environment:
   sdk: ^3.11.3
